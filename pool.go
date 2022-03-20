@@ -62,6 +62,9 @@ type Pool struct {
 	stopHeartbeat chan struct{}
 
 	options *Options
+
+	// runningWorkers 运行中的有状态任务mapping
+	runningWorkers map[int]*goWorker
 }
 
 // purgePeriodically clears expired workers periodically which runs in an individual goroutine, as a scavenger.
@@ -83,6 +86,14 @@ func (p *Pool) purgePeriodically() {
 
 		p.lock.Lock()
 		expiredWorkers := p.workers.retrieveExpiry(p.options.ExpiryDuration)
+		// 有状态工作队列超时判断
+		statefulExpiredWorkers := make([]*goWorker, 0, len(p.runningWorkers))
+		expiryTime := time.Now().Add(-p.options.ExpiryDuration)
+		for _, w := range p.runningWorkers {
+			if expiryTime.Before(w.recycleTime) {
+				statefulExpiredWorkers = append(statefulExpiredWorkers, w)
+			}
+		}
 		p.lock.Unlock()
 
 		// Notify obsolete workers to stop.
@@ -92,6 +103,9 @@ func (p *Pool) purgePeriodically() {
 		for i := range expiredWorkers {
 			expiredWorkers[i].task <- nil
 			expiredWorkers[i] = nil
+		}
+		for _, w := range statefulExpiredWorkers {
+			w.task <- nil
 		}
 
 		// There might be a situation that all workers have been cleaned up(no any worker is running)
@@ -122,15 +136,21 @@ func NewPool(size int, options ...Option) (*Pool, error) {
 	}
 
 	p := &Pool{
-		capacity:      int32(size),
-		lock:          internal.NewSpinLock(),
-		stopHeartbeat: make(chan struct{}, 1),
-		options:       opts,
+		capacity:       int32(size),
+		lock:           internal.NewSpinLock(),
+		stopHeartbeat:  make(chan struct{}, 1),
+		options:        opts,
+		runningWorkers: make(map[int]*goWorker),
+	}
+	// 设置 task buffer
+	taskBuffer := opts.TaskBuffer
+	if taskBuffer <= 0 {
+		taskBuffer = workerChanCap
 	}
 	p.workerCache.New = func() interface{} {
 		return &goWorker{
 			pool: p,
-			task: make(chan func(), workerChanCap),
+			task: make(chan func(), taskBuffer),
 		}
 	}
 	if p.options.PreAlloc {
@@ -164,6 +184,24 @@ func (p *Pool) Submit(task func()) error {
 	}
 	var w *goWorker
 	if w = p.retrieveWorker(); w == nil {
+		return ErrPoolOverload
+	}
+	w.task <- task
+	return nil
+}
+
+// SubmitWithID 根据ID分配任务,相同id的任务会分配给同一个worker,保证task的顺序执行和单线程执行
+//  注意创建pool时必须添加 WithTaskBuffer(nums) ,否则该方法退化为无状态的 Submit
+//  @receiver p
+//  @param id id若<=0 则退化为无状态的 Submit
+//  @param task
+//  @return error
+func (p *Pool) SubmitWithID(id int, task func()) error {
+	if p.IsClosed() {
+		return ErrPoolClosed
+	}
+	var w *goWorker
+	if w = p.retrieveWorkerWithID(id); w == nil {
 		return ErrPoolOverload
 	}
 	w.task <- task
@@ -217,6 +255,7 @@ func (p *Pool) Release() {
 	}
 	p.lock.Lock()
 	p.workers.reset()
+	p.runningWorkers = make(map[int]*goWorker)
 	p.lock.Unlock()
 	// There might be some callers waiting in retrieveWorker(), so we need to wake them up to prevent
 	// those callers blocking infinitely.
@@ -315,6 +354,65 @@ func (p *Pool) retrieveWorker() (w *goWorker) {
 	return
 }
 
+// retrieveWorkerWithID 根据id获取worker
+func (p *Pool) retrieveWorkerWithID(id int) (w *goWorker) {
+	spawnWorker := func() {
+		w = p.workerCache.Get().(*goWorker)
+		w.id = id
+		w.runStateful()
+	}
+
+	p.lock.Lock()
+	// 先从stateful map获取
+	ok := false
+	if id > 0 {
+		w, ok = p.runningWorkers[id]
+	}
+	if !ok {
+		w = p.workers.detach()
+	}
+	if w != nil { // first try to fetch the worker from the queue
+		p.lock.Unlock()
+	} else if capacity := p.Cap(); capacity == -1 || capacity > p.Running() {
+		// if the worker queue is empty and we don't run out of the pool capacity,
+		// then just spawn a new worker goroutine.
+		spawnWorker()
+		p.lock.Unlock()
+	} else { // otherwise, we'll have to keep them blocked and wait for at least one worker to be put back into pool.
+		if p.options.Nonblocking {
+			p.lock.Unlock()
+			return
+		}
+	retry:
+		if p.options.MaxBlockingTasks != 0 && p.blockingNum >= p.options.MaxBlockingTasks {
+			p.lock.Unlock()
+			return
+		}
+		p.blockingNum++
+		p.cond.Wait() // block and wait for an available worker
+		p.blockingNum--
+		var nw int
+		if nw = p.Running(); nw == 0 { // awakened by the scavenger
+			if !p.IsClosed() {
+				spawnWorker()
+			}
+			p.lock.Unlock()
+			return
+		}
+		if w = p.workers.detach(); w == nil {
+			if nw < capacity {
+				spawnWorker()
+				p.lock.Unlock()
+				return
+			}
+			goto retry
+		}
+
+		p.lock.Unlock()
+	}
+	return
+}
+
 // revertWorker puts a worker back into free pool, recycling the goroutines.
 func (p *Pool) revertWorker(worker *goWorker) bool {
 	if capacity := p.Cap(); (capacity > 0 && p.Running() > capacity) || p.IsClosed() {
@@ -339,6 +437,38 @@ func (p *Pool) revertWorker(worker *goWorker) bool {
 
 	// Notify the invoker stuck in 'retrieveWorker()' of there is an available worker in the worker queue.
 	p.cond.Signal()
+	p.lock.Unlock()
+	return true
+}
+
+func (p *Pool) allocStatefulWorker(worker *goWorker) bool {
+	// p.lock.Lock()
+	//
+	// // To avoid memory leaks, add a double check in the lock scope.
+	// // Issue: https://github.com/panjf2000/ants/issues/113
+	// if p.IsClosed() {
+	// 	p.lock.Unlock()
+	// 	return false
+	// }
+
+	p.runningWorkers[worker.id] = worker
+
+	// p.lock.Unlock()
+	return true
+}
+
+func (p *Pool) releaseStatefulWorker(worker *goWorker) bool {
+	p.lock.Lock()
+
+	// To avoid memory leaks, add a double check in the lock scope.
+	// Issue: https://github.com/panjf2000/ants/issues/113
+	if p.IsClosed() {
+		p.lock.Unlock()
+		return false
+	}
+	worker.id = 0
+	delete(p.runningWorkers, worker.id)
+
 	p.lock.Unlock()
 	return true
 }

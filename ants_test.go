@@ -24,6 +24,7 @@ package ants
 
 import (
 	"log"
+	"math/rand"
 	"os"
 	"runtime"
 	"sync"
@@ -189,9 +190,9 @@ func TestAntsPoolWithFuncGetWorkerFromCachePreMalloc(t *testing.T) {
 	t.Logf("memory usage:%d MB", curMem)
 }
 
-//-------------------------------------------------------------------------------------------
+// -------------------------------------------------------------------------------------------
 // Contrast between goroutines without a pool and goroutines with ants pool.
-//-------------------------------------------------------------------------------------------
+// -------------------------------------------------------------------------------------------
 
 func TestNoPool(t *testing.T) {
 	var wg sync.WaitGroup
@@ -232,8 +233,8 @@ func TestAntsPool(t *testing.T) {
 	t.Logf("memory usage:%d MB", curMem)
 }
 
-//-------------------------------------------------------------------------------------------
-//-------------------------------------------------------------------------------------------
+// -------------------------------------------------------------------------------------------
+// -------------------------------------------------------------------------------------------
 
 func TestPanicHandler(t *testing.T) {
 	var panicCounter int64
@@ -845,4 +846,36 @@ func TestReleaseTimeout(t *testing.T) {
 	assert.NotZero(t, pf.Running())
 	err = pf.ReleaseTimeout(2 * time.Second)
 	assert.NoError(t, err)
+}
+
+func TestPool_SubmitWithID(t *testing.T) {
+	rand.Seed(time.Now().Unix())
+	p, _ := NewPool(10, WithTaskBuffer(10))
+	var wg sync.WaitGroup
+	wg.Add(10)
+	for i := 0; i < 5; i++ {
+		idx := i
+		go func() {
+			t.Log("prepare ", idx)
+			_ = p.SubmitWithID(1, func() {
+				t.Log("begin ", idx)
+				// time.Sleep(time.Duration(rand.Int31n(400)+1) * time.Millisecond)
+				t.Log("end ", idx)
+				wg.Done()
+			})
+		}()
+	}
+	for i := 5; i < 10; i++ {
+		idx := i
+		go func() {
+			t.Log("prepare ", idx)
+			_ = p.SubmitWithID(2, func() {
+				t.Log("begin ", idx)
+				// time.Sleep(time.Duration(rand.Int31n(400)+1) * time.Millisecond)
+				t.Log("end ", idx)
+				wg.Done()
+			})
+		}()
+	}
+	wg.Wait()
 }

@@ -39,6 +39,9 @@ type goWorker struct {
 
 	// recycleTime will be updated when putting a worker back into queue.
 	recycleTime time.Time
+
+	// pool 为stateful时有效
+	id int
 }
 
 // run starts a goroutine to repeat the process
@@ -70,6 +73,50 @@ func (w *goWorker) run() {
 			f()
 			if ok := w.pool.revertWorker(w); !ok {
 				return
+			}
+		}
+	}()
+}
+
+func (w *goWorker) runStateful() {
+	w.pool.incRunning()
+	if w.id > 0 {
+		w.pool.allocStatefulWorker(w)
+	}
+	go func() {
+		defer func() {
+			if w.id > 0 {
+				w.pool.releaseStatefulWorker(w)
+			}
+			w.pool.decRunning()
+			w.pool.workerCache.Put(w)
+			if p := recover(); p != nil {
+				if ph := w.pool.options.PanicHandler; ph != nil {
+					ph(p)
+				} else {
+					w.pool.options.Logger.Printf("worker exits from a panic: %v\n", p)
+					var buf [4096]byte
+					n := runtime.Stack(buf[:], false)
+					w.pool.options.Logger.Printf("worker exits from panic: %s\n", string(buf[:n]))
+				}
+			}
+			// Call Signal() here in case there are goroutines waiting for available workers.
+			w.pool.cond.Signal()
+		}()
+
+		for f := range w.task {
+			if f == nil {
+				return
+			}
+			w.pool.options.Logger.Printf("worker: %d prepare\n", w.id)
+			f()
+			if w.id <= 0 {
+				if ok := w.pool.revertWorker(w); !ok {
+					return
+				}
+			} else {
+				// 有状态的worker不回收只保活
+				w.recycleTime = time.Now()
 			}
 		}
 	}()

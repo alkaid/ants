@@ -7,6 +7,8 @@ type Option func(opts *Options)
 
 func loadOptions(options ...Option) *Options {
 	opts := new(Options)
+	// 用-1标志用户未设置
+	opts.TaskBuffer = -1
 	for _, option := range options {
 		option(opts)
 	}
@@ -39,12 +41,21 @@ type Options struct {
 	// Logger is the customized logger for logging info, if it is not set,
 	// default standard logger from log package is used.
 	Logger Logger
+
+	// TaskBuffer task队列的大小 Stateful 为true时才有效
+	TaskBuffer int
 }
 
 // WithOptions accepts the whole options config.
 func WithOptions(options Options) Option {
 	return func(opts *Options) {
 		*opts = options
+	}
+}
+
+func WithTaskBuffer(taskBuffer int) Option {
+	return func(opts *Options) {
+		opts.TaskBuffer = taskBuffer
 	}
 }
 

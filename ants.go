@@ -37,6 +37,9 @@ const (
 
 	// DefaultCleanIntervalTime is the interval time to clean up goroutines.
 	DefaultCleanIntervalTime = time.Second
+
+	// DefaultStatefulTaskBuffer 有状态task的默认队列长度
+	DefaultStatefulTaskBuffer = 100
 )
 
 const (
