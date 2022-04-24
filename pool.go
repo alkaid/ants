@@ -466,8 +466,8 @@ func (p *Pool) releaseStatefulWorker(worker *goWorker) bool {
 		p.lock.Unlock()
 		return false
 	}
-	worker.id = 0
 	delete(p.runningWorkers, worker.id)
+	worker.id = 0
 
 	p.lock.Unlock()
 	return true
