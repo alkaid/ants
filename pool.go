@@ -23,7 +23,7 @@
 package ants
 
 import (
-	"errors"
+	"context"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -56,10 +56,11 @@ type Pool struct {
 	// workerCache speeds up the obtainment of a usable worker in function:retrieveWorker.
 	workerCache sync.Pool
 
-	// blockingNum is the number of the goroutines already been blocked on pool.Submit, protected by pool.lock
-	blockingNum int
+	// waiting is the number of goroutines already been blocked on pool.Submit(), protected by pool.lock
+	waiting int32
 
-	stopHeartbeat chan struct{}
+	heartbeatDone int32
+	stopHeartbeat context.CancelFunc
 
 	options *Options
 
@@ -68,15 +69,17 @@ type Pool struct {
 }
 
 // purgePeriodically clears expired workers periodically which runs in an individual goroutine, as a scavenger.
-func (p *Pool) purgePeriodically() {
+func (p *Pool) purgePeriodically(ctx context.Context) {
 	heartbeat := time.NewTicker(p.options.ExpiryDuration)
-	defer heartbeat.Stop()
+	defer func() {
+		heartbeat.Stop()
+		atomic.StoreInt32(&p.heartbeatDone, 1)
+	}()
 
 	for {
 		select {
 		case <-heartbeat.C:
-		case <-p.stopHeartbeat:
-			p.stopHeartbeat <- struct{}{}
+		case <-ctx.Done():
 			return
 		}
 
@@ -108,10 +111,11 @@ func (p *Pool) purgePeriodically() {
 			w.task <- nil
 		}
 
-		// There might be a situation that all workers have been cleaned up(no any worker is running)
+		// There might be a situation where all workers have been cleaned up(no worker is running),
+		// or another case where the pool capacity has been Tuned up,
 		// while some invokers still get stuck in "p.cond.Wait()",
 		// then it ought to wake all those invokers.
-		if p.Running() == 0 {
+		if p.Running() == 0 || (p.Waiting() > 0 && p.Free() > 0) {
 			p.cond.Broadcast()
 		}
 	}
@@ -138,7 +142,6 @@ func NewPool(size int, options ...Option) (*Pool, error) {
 	p := &Pool{
 		capacity:       int32(size),
 		lock:           internal.NewSpinLock(),
-		stopHeartbeat:  make(chan struct{}, 1),
 		options:        opts,
 		runningWorkers: make(map[int]*goWorker),
 	}
@@ -165,7 +168,9 @@ func NewPool(size int, options ...Option) (*Pool, error) {
 	p.cond = sync.NewCond(p.lock)
 
 	// Start a goroutine to clean up expired workers periodically.
-	go p.purgePeriodically()
+	var ctx context.Context
+	ctx, p.stopHeartbeat = context.WithCancel(context.Background())
+	go p.purgePeriodically(ctx)
 
 	return p, nil
 }
@@ -209,17 +214,23 @@ func (p *Pool) SubmitWithID(id int, task func()) error {
 }
 
 // Running returns the amount of the currently running goroutines.
+// Running returns the number of workers currently running.
 func (p *Pool) Running() int {
 	return int(atomic.LoadInt32(&p.running))
 }
 
-// Free returns the amount of available goroutines to work, -1 indicates this pool is unlimited.
+// Free returns the number of available goroutines to work, -1 indicates this pool is unlimited.
 func (p *Pool) Free() int {
 	c := p.Cap()
 	if c < 0 {
 		return -1
 	}
 	return c - p.Running()
+}
+
+// Waiting returns the number of tasks which are waiting be executed.
+func (p *Pool) Waiting() int {
+	return int(atomic.LoadInt32(&p.waiting))
 }
 
 // Cap returns the capacity of this pool.
@@ -264,18 +275,17 @@ func (p *Pool) Release() {
 
 // ReleaseTimeout is like Release but with a timeout, it waits all workers to exit before timing out.
 func (p *Pool) ReleaseTimeout(timeout time.Duration) error {
-	if p.IsClosed() {
-		return errors.New("pool is already closed")
+	if p.IsClosed() || p.stopHeartbeat == nil {
+		return ErrPoolClosed
 	}
-	select {
-	case p.stopHeartbeat <- struct{}{}:
-		<-p.stopHeartbeat
-	default:
-	}
+
+	p.stopHeartbeat()
+	p.stopHeartbeat = nil
 	p.Release()
+
 	endTime := time.Now().Add(timeout)
 	for time.Now().Before(endTime) {
-		if p.Running() == 0 {
+		if p.Running() == 0 && atomic.LoadInt32(&p.heartbeatDone) == 1 {
 			return nil
 		}
 		time.Sleep(10 * time.Millisecond)
@@ -286,20 +296,21 @@ func (p *Pool) ReleaseTimeout(timeout time.Duration) error {
 // Reboot reboots a closed pool.
 func (p *Pool) Reboot() {
 	if atomic.CompareAndSwapInt32(&p.state, CLOSED, OPENED) {
-		go p.purgePeriodically()
+		atomic.StoreInt32(&p.heartbeatDone, 0)
+		var ctx context.Context
+		ctx, p.stopHeartbeat = context.WithCancel(context.Background())
+		go p.purgePeriodically(ctx)
 	}
 }
 
 // ---------------------------------------------------------------------------
 
-// incRunning increases the number of the currently running goroutines.
-func (p *Pool) incRunning() {
-	atomic.AddInt32(&p.running, 1)
+func (p *Pool) addRunning(delta int) {
+	atomic.AddInt32(&p.running, int32(delta))
 }
 
-// decRunning decreases the number of the currently running goroutines.
-func (p *Pool) decRunning() {
-	atomic.AddInt32(&p.running, -1)
+func (p *Pool) addWaiting(delta int) {
+	atomic.AddInt32(&p.waiting, int32(delta))
 }
 
 // retrieveWorker returns an available worker to run the tasks.
@@ -325,30 +336,33 @@ func (p *Pool) retrieveWorker() (w *goWorker) {
 			return
 		}
 	retry:
-		if p.options.MaxBlockingTasks != 0 && p.blockingNum >= p.options.MaxBlockingTasks {
+		if p.options.MaxBlockingTasks != 0 && p.Waiting() >= p.options.MaxBlockingTasks {
 			p.lock.Unlock()
 			return
 		}
-		p.blockingNum++
+		p.addWaiting(1)
 		p.cond.Wait() // block and wait for an available worker
-		p.blockingNum--
+		p.addWaiting(-1)
+
+		if p.IsClosed() {
+			p.lock.Unlock()
+			return
+		}
+
 		var nw int
 		if nw = p.Running(); nw == 0 { // awakened by the scavenger
 			p.lock.Unlock()
-			if !p.IsClosed() {
-				spawnWorker()
-			}
+			spawnWorker()
 			return
 		}
 		if w = p.workers.detach(); w == nil {
-			if nw < capacity {
+			if nw < p.Cap() {
 				p.lock.Unlock()
 				spawnWorker()
 				return
 			}
 			goto retry
 		}
-
 		p.lock.Unlock()
 	}
 	return
@@ -384,30 +398,33 @@ func (p *Pool) retrieveWorkerWithID(id int) (w *goWorker) {
 			return
 		}
 	retry:
-		if p.options.MaxBlockingTasks != 0 && p.blockingNum >= p.options.MaxBlockingTasks {
+		if p.options.MaxBlockingTasks != 0 && p.Waiting() >= p.options.MaxBlockingTasks {
 			p.lock.Unlock()
 			return
 		}
-		p.blockingNum++
+		p.addWaiting(1)
 		p.cond.Wait() // block and wait for an available worker
-		p.blockingNum--
+		p.addWaiting(-1)
+
+		if p.IsClosed() {
+			p.lock.Unlock()
+			return
+		}
+
 		var nw int
 		if nw = p.Running(); nw == 0 { // awakened by the scavenger
-			if !p.IsClosed() {
-				spawnWorker()
-			}
 			p.lock.Unlock()
+			spawnWorker()
 			return
 		}
 		if w = p.workers.detach(); w == nil {
-			if nw < capacity {
-				spawnWorker()
+			if nw < p.Cap() {
 				p.lock.Unlock()
+				spawnWorker()
 				return
 			}
 			goto retry
 		}
-
 		p.lock.Unlock()
 	}
 	return
