@@ -564,6 +564,118 @@ func TestInfinitePool(t *testing.T) {
 	}
 }
 
+func testPoolWithDisablePurge(t *testing.T, p *Pool, numWorker int, waitForPurge time.Duration) {
+	sig := make(chan struct{})
+	var wg1, wg2 sync.WaitGroup
+	wg1.Add(numWorker)
+	wg2.Add(numWorker)
+	for i := 0; i < numWorker; i++ {
+		_ = p.Submit(func() {
+			wg1.Done()
+			<-sig
+			wg2.Done()
+		})
+	}
+	wg1.Wait()
+
+	runningCnt := p.Running()
+	assert.EqualValuesf(t, numWorker, runningCnt, "expect %d workers running, but got %d", numWorker, runningCnt)
+	freeCnt := p.Free()
+	assert.EqualValuesf(t, 0, freeCnt, "expect %d free workers, but got %d", 0, freeCnt)
+
+	// Finish all tasks and sleep for a while to wait for purging, since we've disabled purge mechanism,
+	// we should see that all workers are still running after the sleep.
+	close(sig)
+	wg2.Wait()
+	time.Sleep(waitForPurge + waitForPurge/2)
+
+	runningCnt = p.Running()
+	assert.EqualValuesf(t, numWorker, runningCnt, "expect %d workers running, but got %d", numWorker, runningCnt)
+	freeCnt = p.Free()
+	assert.EqualValuesf(t, 0, freeCnt, "expect %d free workers, but got %d", 0, freeCnt)
+
+	err := p.ReleaseTimeout(waitForPurge + waitForPurge/2)
+	assert.NoErrorf(t, err, "release pool failed: %v", err)
+
+	runningCnt = p.Running()
+	assert.EqualValuesf(t, 0, runningCnt, "expect %d workers running, but got %d", 0, runningCnt)
+	freeCnt = p.Free()
+	assert.EqualValuesf(t, numWorker, freeCnt, "expect %d free workers, but got %d", numWorker, freeCnt)
+}
+
+func TestWithDisablePurgePool(t *testing.T) {
+	numWorker := 10
+	p, _ := NewPool(numWorker, WithDisablePurge(true))
+	testPoolWithDisablePurge(t, p, numWorker, DefaultCleanIntervalTime)
+}
+
+func TestWithDisablePurgeAndWithExpirationPool(t *testing.T) {
+	numWorker := 10
+	expiredDuration := time.Millisecond * 100
+	p, _ := NewPool(numWorker, WithDisablePurge(true), WithExpiryDuration(expiredDuration))
+	testPoolWithDisablePurge(t, p, numWorker, expiredDuration)
+}
+
+func testPoolFuncWithDisablePurge(t *testing.T, p *PoolWithFunc, numWorker int, wg1, wg2 *sync.WaitGroup, sig chan struct{}, waitForPurge time.Duration) {
+	for i := 0; i < numWorker; i++ {
+		_ = p.Invoke(i)
+	}
+	wg1.Wait()
+
+	runningCnt := p.Running()
+	assert.EqualValuesf(t, numWorker, runningCnt, "expect %d workers running, but got %d", numWorker, runningCnt)
+	freeCnt := p.Free()
+	assert.EqualValuesf(t, 0, freeCnt, "expect %d free workers, but got %d", 0, freeCnt)
+
+	// Finish all tasks and sleep for a while to wait for purging, since we've disabled purge mechanism,
+	// we should see that all workers are still running after the sleep.
+	close(sig)
+	wg2.Wait()
+	time.Sleep(waitForPurge + waitForPurge/2)
+
+	runningCnt = p.Running()
+	assert.EqualValuesf(t, numWorker, runningCnt, "expect %d workers running, but got %d", numWorker, runningCnt)
+	freeCnt = p.Free()
+	assert.EqualValuesf(t, 0, freeCnt, "expect %d free workers, but got %d", 0, freeCnt)
+
+	err := p.ReleaseTimeout(waitForPurge + waitForPurge/2)
+	assert.NoErrorf(t, err, "release pool failed: %v", err)
+
+	runningCnt = p.Running()
+	assert.EqualValuesf(t, 0, runningCnt, "expect %d workers running, but got %d", 0, runningCnt)
+	freeCnt = p.Free()
+	assert.EqualValuesf(t, numWorker, freeCnt, "expect %d free workers, but got %d", numWorker, freeCnt)
+}
+
+func TestWithDisablePurgePoolFunc(t *testing.T) {
+	numWorker := 10
+	sig := make(chan struct{})
+	var wg1, wg2 sync.WaitGroup
+	wg1.Add(numWorker)
+	wg2.Add(numWorker)
+	p, _ := NewPoolWithFunc(numWorker, func(i interface{}) {
+		wg1.Done()
+		<-sig
+		wg2.Done()
+	}, WithDisablePurge(true))
+	testPoolFuncWithDisablePurge(t, p, numWorker, &wg1, &wg2, sig, DefaultCleanIntervalTime)
+}
+
+func TestWithDisablePurgeAndWithExpirationPoolFunc(t *testing.T) {
+	numWorker := 2
+	sig := make(chan struct{})
+	var wg1, wg2 sync.WaitGroup
+	wg1.Add(numWorker)
+	wg2.Add(numWorker)
+	expiredDuration := time.Millisecond * 100
+	p, _ := NewPoolWithFunc(numWorker, func(i interface{}) {
+		wg1.Done()
+		<-sig
+		wg2.Done()
+	}, WithDisablePurge(true), WithExpiryDuration(expiredDuration))
+	testPoolFuncWithDisablePurge(t, p, numWorker, &wg1, &wg2, sig, expiredDuration)
+}
+
 func TestInfinitePoolWithFunc(t *testing.T) {
 	c := make(chan struct{})
 	p, _ := NewPoolWithFunc(-1, func(i interface{}) {
