@@ -108,7 +108,7 @@ func (w *goWorker) runStateful() {
 			if f == nil {
 				return
 			}
-			w.pool.options.Logger.Printf("worker: %d prepare\n", w.id)
+			// w.pool.options.Logger.Printf("worker: %d prepare\n", w.id)
 			f()
 			if w.id <= 0 {
 				if ok := w.pool.revertWorker(w); !ok {
