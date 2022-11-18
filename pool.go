@@ -71,6 +71,7 @@ type Pool struct {
 // purgePeriodically clears expired workers periodically which runs in an individual goroutine, as a scavenger.
 func (p *Pool) purgePeriodically(ctx context.Context) {
 	heartbeat := time.NewTicker(p.options.ExpiryDuration)
+
 	defer func() {
 		heartbeat.Stop()
 		atomic.StoreInt32(&p.heartbeatDone, 1)
@@ -129,10 +130,12 @@ func NewPool(size int, options ...Option) (*Pool, error) {
 		size = -1
 	}
 
-	if expiry := opts.ExpiryDuration; expiry < 0 {
-		return nil, ErrInvalidPoolExpiry
-	} else if expiry == 0 {
-		opts.ExpiryDuration = DefaultCleanIntervalTime
+	if !opts.DisablePurge {
+		if expiry := opts.ExpiryDuration; expiry < 0 {
+			return nil, ErrInvalidPoolExpiry
+		} else if expiry == 0 {
+			opts.ExpiryDuration = DefaultCleanIntervalTime
+		}
 	}
 
 	if opts.Logger == nil {
@@ -170,8 +173,9 @@ func NewPool(size int, options ...Option) (*Pool, error) {
 	// Start a goroutine to clean up expired workers periodically.
 	var ctx context.Context
 	ctx, p.stopHeartbeat = context.WithCancel(context.Background())
-	go p.purgePeriodically(ctx)
-
+	if !p.options.DisablePurge {
+		go p.purgePeriodically(ctx)
+	}
 	return p, nil
 }
 
@@ -196,11 +200,12 @@ func (p *Pool) Submit(task func()) error {
 }
 
 // SubmitWithID 根据ID分配任务,相同id的任务会分配给同一个worker,保证task的顺序执行和单线程执行
-//  注意创建pool时必须添加 WithTaskBuffer(nums) ,否则该方法退化为无状态的 Submit
-//  @receiver p
-//  @param id id若<=0 则退化为无状态的 Submit
-//  @param task
-//  @return error
+//
+//	注意创建pool时必须添加 WithTaskBuffer(nums) ,否则该方法退化为无状态的 Submit
+//	@receiver p
+//	@param id id若<=0 则退化为无状态的 Submit
+//	@param task
+//	@return error
 func (p *Pool) SubmitWithID(id int, task func()) error {
 	if p.IsClosed() {
 		return ErrPoolClosed
@@ -285,7 +290,7 @@ func (p *Pool) ReleaseTimeout(timeout time.Duration) error {
 
 	endTime := time.Now().Add(timeout)
 	for time.Now().Before(endTime) {
-		if p.Running() == 0 && atomic.LoadInt32(&p.heartbeatDone) == 1 {
+		if p.Running() == 0 && (p.options.DisablePurge || atomic.LoadInt32(&p.heartbeatDone) == 1) {
 			return nil
 		}
 		time.Sleep(10 * time.Millisecond)
@@ -299,7 +304,9 @@ func (p *Pool) Reboot() {
 		atomic.StoreInt32(&p.heartbeatDone, 0)
 		var ctx context.Context
 		ctx, p.stopHeartbeat = context.WithCancel(context.Background())
-		go p.purgePeriodically(ctx)
+		if !p.options.DisablePurge {
+			go p.purgePeriodically(ctx)
+		}
 	}
 }
 

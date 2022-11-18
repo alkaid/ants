@@ -44,6 +44,9 @@ type Options struct {
 
 	// TaskBuffer task队列的大小 Stateful 为true时才有效
 	TaskBuffer int
+
+	// When DisablePurge is true, workers are not purged and are resident.
+	DisablePurge bool
 }
 
 // WithOptions accepts the whole options config.
@@ -98,5 +101,12 @@ func WithPanicHandler(panicHandler func(interface{})) Option {
 func WithLogger(logger Logger) Option {
 	return func(opts *Options) {
 		opts.Logger = logger
+	}
+}
+
+// WithDisablePurge indicates whether we turn off automatically purge.
+func WithDisablePurge(disable bool) Option {
+	return func(opts *Options) {
+		opts.DisablePurge = disable
 	}
 }
