@@ -42,12 +42,21 @@ type Options struct {
 
 	// When DisablePurge is true, workers are not purged and are resident.
 	DisablePurge bool
+
+	// TaskBuffer task队列的大小 NewPoolWithID 才有效
+	TaskBuffer int
 }
 
 // WithOptions accepts the whole options config.
 func WithOptions(options Options) Option {
 	return func(opts *Options) {
 		*opts = options
+	}
+}
+
+func WithTaskBuffer(taskBuffer int) Option {
+	return func(opts *Options) {
+		opts.TaskBuffer = taskBuffer
 	}
 }
 
