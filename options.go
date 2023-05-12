@@ -43,20 +43,17 @@ type Options struct {
 	// When DisablePurge is true, workers are not purged and are resident.
 	DisablePurge bool
 
-	// TaskBuffer task队列的大小 NewPoolWithID 才有效
+	// TaskBuffer task队列的大小,仅在 NewPoolWithID 有效
 	TaskBuffer int
+
+	// DisablePurgeRunning 禁止回收正在运行的线程(即使超时),仅在 NewPoolWithID 有效
+	DisablePurgeRunning bool
 }
 
 // WithOptions accepts the whole options config.
 func WithOptions(options Options) Option {
 	return func(opts *Options) {
 		*opts = options
-	}
-}
-
-func WithTaskBuffer(taskBuffer int) Option {
-	return func(opts *Options) {
-		opts.TaskBuffer = taskBuffer
 	}
 }
 
@@ -106,5 +103,19 @@ func WithLogger(logger Logger) Option {
 func WithDisablePurge(disable bool) Option {
 	return func(opts *Options) {
 		opts.DisablePurge = disable
+	}
+}
+
+// WithDisablePurgeRunning 禁止回收正在运行的线程(即使超时),仅在 NewPoolWithID 有效
+func WithDisablePurgeRunning(disable bool) Option {
+	return func(opts *Options) {
+		opts.DisablePurgeRunning = disable
+	}
+}
+
+// WithTaskBuffer task队列的大小,仅在 NewPoolWithID 有效
+func WithTaskBuffer(taskBuffer int) Option {
+	return func(opts *Options) {
+		opts.TaskBuffer = taskBuffer
 	}
 }

@@ -197,8 +197,9 @@ func NewPoolWithID(size int, options ...Option) (*PoolWithID, error) {
 	}
 	p.workerCache.New = func() interface{} {
 		return &goWorkerWithID{
-			pool: p,
-			task: make(chan func(), taskBuffer),
+			pool:      p,
+			task:      make(chan func(), taskBuffer),
+			keepAlive: opts.DisablePurgeRunning,
 		}
 	}
 	p.workers = newWorkerMap(0)

@@ -42,6 +42,10 @@ type goWorkerWithID struct {
 
 	// pool 为stateful时有效
 	id int
+
+	running bool
+
+	keepAlive bool
 }
 
 // run starts a goroutine to repeat the process
@@ -52,6 +56,7 @@ func (w *goWorkerWithID) run() {
 	w.pool.addRunning(1)
 	go func() {
 		defer func() {
+			w.running = false
 			w.pool.releaseWorker(w)
 			w.pool.addRunning(-1)
 			w.pool.workerCache.Put(w)
@@ -63,6 +68,7 @@ func (w *goWorkerWithID) run() {
 			if f == nil {
 				return
 			}
+			w.running = true
 			// 安全执行,崩溃要恢复并执行下一个任务
 			safeF := func() {
 				defer func() {
@@ -80,6 +86,7 @@ func (w *goWorkerWithID) run() {
 			if ok := w.pool.revertWorker(w); !ok {
 				return
 			}
+			w.running = false
 		}
 	}()
 }
@@ -89,6 +96,10 @@ func (w *goWorkerWithID) finish() {
 }
 
 func (w *goWorkerWithID) lastUsedTime() time.Time {
+	// 若保活且运行中则返回now,避免被回收
+	if w.keepAlive && w.running {
+		return w.pool.nowTime()
+	}
 	return w.lastUsed
 }
 
