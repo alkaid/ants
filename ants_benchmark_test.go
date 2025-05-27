@@ -20,15 +20,18 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
 
-package ants
+package ants_test
 
 import (
 	"runtime"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"golang.org/x/sync/errgroup"
+
+	"github.com/panjf2000/ants/v2"
 )
 
 const (
@@ -42,25 +45,29 @@ func demoFunc() {
 	time.Sleep(time.Duration(BenchParam) * time.Millisecond)
 }
 
-func demoPoolFunc(args interface{}) {
+func demoPoolFunc(args any) {
 	n := args.(int)
 	time.Sleep(time.Duration(n) * time.Millisecond)
 }
 
+func demoPoolFuncInt(n int) {
+	time.Sleep(time.Duration(n) * time.Millisecond)
+}
+
+var stopLongRunningFunc int32
+
 func longRunningFunc() {
-	for {
+	for atomic.LoadInt32(&stopLongRunningFunc) == 0 {
 		runtime.Gosched()
 	}
 }
 
-func longRunningPoolFunc(arg interface{}) {
-	if ch, ok := arg.(chan struct{}); ok {
-		<-ch
-		return
-	}
-	for {
-		runtime.Gosched()
-	}
+func longRunningPoolFunc(arg any) {
+	<-arg.(chan struct{})
+}
+
+func longRunningPoolFuncCh(ch chan struct{}) {
+	<-ch
 }
 
 func BenchmarkGoroutines(b *testing.B) {
@@ -117,8 +124,26 @@ func BenchmarkErrGroup(b *testing.B) {
 
 func BenchmarkAntsPool(b *testing.B) {
 	var wg sync.WaitGroup
-	p, _ := NewPool(PoolCap, WithExpiryDuration(DefaultExpiredTime))
+	p, _ := ants.NewPool(PoolCap, ants.WithExpiryDuration(DefaultExpiredTime))
 	defer p.Release()
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		wg.Add(RunTimes)
+		for j := 0; j < RunTimes; j++ {
+			_ = p.Submit(func() {
+				demoFunc()
+				wg.Done()
+			})
+		}
+		wg.Wait()
+	}
+}
+
+func BenchmarkAntsMultiPool(b *testing.B) {
+	var wg sync.WaitGroup
+	p, _ := ants.NewMultiPool(10, PoolCap/10, ants.RoundRobin, ants.WithExpiryDuration(DefaultExpiredTime))
+	defer p.ReleaseTimeout(DefaultExpiredTime) //nolint:errcheck
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
@@ -155,7 +180,7 @@ func BenchmarkSemaphoreThroughput(b *testing.B) {
 }
 
 func BenchmarkAntsPoolThroughput(b *testing.B) {
-	p, _ := NewPool(PoolCap, WithExpiryDuration(DefaultExpiredTime))
+	p, _ := ants.NewPool(PoolCap, ants.WithExpiryDuration(DefaultExpiredTime))
 	defer p.Release()
 
 	b.ResetTimer()
@@ -164,4 +189,40 @@ func BenchmarkAntsPoolThroughput(b *testing.B) {
 			_ = p.Submit(demoFunc)
 		}
 	}
+}
+
+func BenchmarkAntsMultiPoolThroughput(b *testing.B) {
+	p, _ := ants.NewMultiPool(10, PoolCap/10, ants.RoundRobin, ants.WithExpiryDuration(DefaultExpiredTime))
+	defer p.ReleaseTimeout(DefaultExpiredTime) //nolint:errcheck
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		for j := 0; j < RunTimes; j++ {
+			_ = p.Submit(demoFunc)
+		}
+	}
+}
+
+func BenchmarkParallelAntsPoolThroughput(b *testing.B) {
+	p, _ := ants.NewPool(PoolCap, ants.WithExpiryDuration(DefaultExpiredTime))
+	defer p.Release()
+
+	b.ResetTimer()
+	b.RunParallel(func(pb *testing.PB) {
+		for pb.Next() {
+			_ = p.Submit(demoFunc)
+		}
+	})
+}
+
+func BenchmarkParallelAntsMultiPoolThroughput(b *testing.B) {
+	p, _ := ants.NewMultiPool(10, PoolCap/10, ants.RoundRobin, ants.WithExpiryDuration(DefaultExpiredTime))
+	defer p.ReleaseTimeout(DefaultExpiredTime) //nolint:errcheck
+
+	b.ResetTimer()
+	b.RunParallel(func(pb *testing.PB) {
+		for pb.Next() {
+			_ = p.Submit(demoFunc)
+		}
+	})
 }

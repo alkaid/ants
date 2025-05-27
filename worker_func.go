@@ -31,11 +31,13 @@ import (
 // it starts a goroutine that accepts tasks and
 // performs function calls.
 type goWorkerWithFunc struct {
+	worker
+
 	// pool who owns this worker.
 	pool *PoolWithFunc
 
-	// args is a job should be done.
-	args chan interface{}
+	// arg is the argument for the function.
+	arg chan any
 
 	// lastUsed will be updated when putting a worker back into queue.
 	lastUsed time.Time
@@ -47,7 +49,11 @@ func (w *goWorkerWithFunc) run() {
 	w.pool.addRunning(1)
 	go func() {
 		defer func() {
-			w.pool.addRunning(-1)
+			if w.pool.addRunning(-1) == 0 && w.pool.IsClosed() {
+				w.pool.once.Do(func() {
+					close(w.pool.allDone)
+				})
+			}
 			w.pool.workerCache.Put(w)
 			if p := recover(); p != nil {
 				if ph := w.pool.options.PanicHandler; ph != nil {
@@ -60,11 +66,11 @@ func (w *goWorkerWithFunc) run() {
 			w.pool.cond.Signal()
 		}()
 
-		for args := range w.args {
-			if args == nil {
+		for arg := range w.arg {
+			if arg == nil {
 				return
 			}
-			w.pool.poolFunc(args)
+			w.pool.fn(arg)
 			if ok := w.pool.revertWorker(w); !ok {
 				return
 			}
@@ -73,17 +79,17 @@ func (w *goWorkerWithFunc) run() {
 }
 
 func (w *goWorkerWithFunc) finish() {
-	w.args <- nil
+	w.arg <- nil
 }
 
 func (w *goWorkerWithFunc) lastUsedTime() time.Time {
 	return w.lastUsed
 }
 
-func (w *goWorkerWithFunc) inputFunc(func()) {
-	panic("unreachable")
+func (w *goWorkerWithFunc) setLastUsedTime(t time.Time) {
+	w.lastUsed = t
 }
 
-func (w *goWorkerWithFunc) inputParam(arg interface{}) {
-	w.args <- arg
+func (w *goWorkerWithFunc) inputArg(arg any) {
+	w.arg <- arg
 }
