@@ -40,12 +40,11 @@ type goWorkerWithID struct {
 	// lastUsed will be updated when putting a worker back into queue.
 	lastUsed time.Time
 
-	// pool 为stateful时有效
 	id int
 
 	running bool
 
-	keepAlive bool
+	keepAlive bool // 针对常驻长时间运行任务须为true
 }
 
 // run starts a goroutine to repeat the process
@@ -58,14 +57,18 @@ func (w *goWorkerWithID) run() {
 		defer func() {
 			w.running = false
 			w.pool.releaseWorker(w)
-			w.pool.addRunning(-1)
+			if w.pool.addRunning(-1) == 0 && w.pool.IsClosed() {
+				w.pool.once.Do(func() {
+					close(w.pool.allDone)
+				})
+			}
 			w.pool.workerCache.Put(w)
 			// Call Signal() here in case there are goroutines waiting for available workers.
 			w.pool.cond.Signal()
 		}()
 
-		for f := range w.task {
-			if f == nil {
+		for fn := range w.task {
+			if fn == nil {
 				return
 			}
 			w.running = true
@@ -80,7 +83,7 @@ func (w *goWorkerWithID) run() {
 						}
 					}
 				}()
-				f()
+				fn()
 			}
 			safeF()
 			if ok := w.pool.revertWorker(w); !ok {
@@ -96,7 +99,7 @@ func (w *goWorkerWithID) finish() {
 }
 
 func (w *goWorkerWithID) lastUsedTime() time.Time {
-	// 若保活且运行中则返回now,避免被回收
+	// 针对常驻长时间运行任务，若保活且运行中则返回now,避免被回收
 	if w.keepAlive && w.running {
 		return w.pool.nowTime()
 	}
@@ -107,6 +110,10 @@ func (w *goWorkerWithID) inputFunc(fn func()) {
 	w.task <- fn
 }
 
-func (w *goWorkerWithID) inputParam(interface{}) {
+func (w *goWorkerWithID) setLastUsedTime(t time.Time) {
+	w.lastUsed = t
+}
+
+func (w *goWorkerWithID) inputArg(any) {
 	panic("unreachable")
 }
