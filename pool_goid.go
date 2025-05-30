@@ -134,8 +134,6 @@ func (p *PoolWithID) revertWorker(worker worker) bool {
 
 	worker.setLastUsedTime(p.nowTime())
 
-	p.lock.Lock()
-
 	// 只保活 不用回收，因为本来就还在map里
 
 	return true
