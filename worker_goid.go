@@ -47,6 +47,21 @@ type goWorkerWithID struct {
 	keepAlive bool // 针对常驻长时间运行任务须为true
 }
 
+func newWorkerWithGoId(pool *PoolWithID) *goWorkerWithID {
+	// 设置 task buffer
+	taskBuffer := pool.options.TaskBuffer
+	if taskBuffer == 0 {
+		taskBuffer = MinTaskBuffer
+	}
+	w := &goWorkerWithID{
+		pool: pool,
+		task: make(chan func(), taskBuffer),
+		// 设置keepAlive
+		keepAlive: pool.options.DisablePurgeRunning,
+	}
+	return w
+}
+
 // run starts a goroutine to repeat the process
 // that performs the function calls.
 //

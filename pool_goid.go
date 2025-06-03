@@ -44,6 +44,14 @@ func (p *PoolWithID) Submit(id int, task func()) error {
 	}
 	w, err := p.retrieveWorker(id)
 	if w != nil {
+		// TODO 队列满且任务内容都是提交任务时必死锁,这里先用容量临时判断,若到达一半则异步提交。后续应该想办法从上下文获取当前线程池和id来对比判断是否要异步提交
+		gw := w.(*goWorkerWithID)
+		if len(gw.task) > p.options.TaskBuffer/2 {
+			err = Submit(func() {
+				w.inputFunc(task)
+			})
+			return err
+		}
 		w.inputFunc(task)
 	}
 	return err
@@ -61,18 +69,8 @@ func NewPoolWithID(size int, options ...Option) (*PoolWithID, error) {
 
 	pool := &PoolWithID{poolCommon: pc}
 
-	// 设置 task buffer
-	taskBuffer := pc.options.TaskBuffer
-	if taskBuffer < MinTaskBuffer {
-		taskBuffer = MinTaskBuffer
-	}
 	pool.workerCache.New = func() any {
-		return &goWorkerWithID{
-			pool: pool,
-			task: make(chan func(), taskBuffer),
-			// 设置keepAlive
-			keepAlive: pc.options.DisablePurgeRunning,
-		}
+		return newWorkerWithGoId(pool)
 	}
 
 	return pool, nil
