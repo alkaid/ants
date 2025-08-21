@@ -61,7 +61,7 @@ func (wq *workerMap) refresh(duration time.Duration) []worker {
 	expiryTime := time.Now().Add(-duration)
 	wq.expiry = wq.expiry[:0]
 	for _, w := range wq.items {
-		if expiryTime.Before(w.lastUsedTime()) {
+		if expiryTime.After(w.lastUsedTime()) {
 			wq.expiry = append(wq.expiry, w)
 			delete(wq.items, w.(*goWorkerWithID).id)
 		}
