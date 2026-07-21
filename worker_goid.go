@@ -24,7 +24,6 @@ package ants
 
 import (
 	"runtime/debug"
-	"time"
 )
 
 // goWorkerWithID is the actual executor who runs the tasks,
@@ -38,7 +37,7 @@ type goWorkerWithID struct {
 	task chan func()
 
 	// lastUsed will be updated when putting a worker back into queue.
-	lastUsed time.Time
+	lastUsed int64
 
 	id int
 
@@ -113,7 +112,7 @@ func (w *goWorkerWithID) finish() {
 	w.task <- nil
 }
 
-func (w *goWorkerWithID) lastUsedTime() time.Time {
+func (w *goWorkerWithID) lastUsedTime() int64 {
 	// 针对常驻长时间运行任务，若保活且运行中则返回now,避免被回收
 	if w.keepAlive && w.running {
 		return w.pool.nowTime()
@@ -125,7 +124,7 @@ func (w *goWorkerWithID) inputFunc(fn func()) {
 	w.task <- fn
 }
 
-func (w *goWorkerWithID) setLastUsedTime(t time.Time) {
+func (w *goWorkerWithID) setLastUsedTime(t int64) {
 	w.lastUsed = t
 }
 

@@ -37,7 +37,7 @@ func (wq *workerMap) detach() worker {
 	panic("workerMap detach unreachable,instead of get(id)")
 }
 
-func (wq *workerMap) get(id int, now time.Time) worker {
+func (wq *workerMap) get(id int, now int64) worker {
 	w, ok := wq.items[id]
 	if !ok {
 		return w
@@ -58,10 +58,10 @@ func (wq *workerMap) refresh(duration time.Duration) []worker {
 		return nil
 	}
 
-	expiryTime := time.Now().Add(-duration)
+	expiryTime := time.Now().Add(-duration).UnixNano()
 	wq.expiry = wq.expiry[:0]
 	for _, w := range wq.items {
-		if expiryTime.After(w.lastUsedTime()) {
+		if expiryTime >= w.lastUsedTime() {
 			wq.expiry = append(wq.expiry, w)
 			delete(wq.items, w.(*goWorkerWithID).id)
 		}
