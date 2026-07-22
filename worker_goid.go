@@ -30,104 +30,77 @@ import (
 // it starts a goroutine that accepts tasks and
 // performs function calls.
 type goWorkerWithID struct {
-	// pool who owns this worker.
-	pool *PoolWithID
+	pool  *PoolWithID
+	entry *workerIDEntry
+	stop  chan struct{}
 
-	// task is a job should be done.
-	task chan func()
-
-	// lastUsed will be updated when putting a worker back into queue.
-	lastUsed int64
-
-	id int
-
-	running bool
-
-	keepAlive bool // 针对常驻长时间运行任务须为true
+	// escapeAnnounced preserves start-before-exit ordering on the event stream
+	// without holding scheduler locks while publishing or logging.
+	escapeAnnounced chan struct{}
 }
 
-func newWorkerWithGoID(pool *PoolWithID) *goWorkerWithID {
-	// 设置 task buffer
-	taskBuffer := pool.options.TaskBuffer
-	if taskBuffer == 0 {
-		taskBuffer = MinTaskBuffer
+func newWorkerWithID(pool *PoolWithID, entry *workerIDEntry) *goWorkerWithID {
+	return &goWorkerWithID{
+		pool:            pool,
+		entry:           entry,
+		stop:            make(chan struct{}),
+		escapeAnnounced: make(chan struct{}),
 	}
-	w := &goWorkerWithID{
-		pool: pool,
-		task: make(chan func(), taskBuffer),
-		// 设置keepAlive
-		keepAlive: pool.options.DisablePurgeRunning,
-	}
-	return w
 }
 
-// run starts a goroutine to repeat the process
-// that performs the function calls.
-//
-//	超时会导致线程退出回收,若任务时长超过超时时间,可能造成泄漏和脏线程
+// run starts this owner. Its managed-capacity slot is reserved by PoolWithID
+// before run is called.
 func (w *goWorkerWithID) run() {
-	w.pool.addRunning(1)
-	go func() {
-		defer func() {
-			w.running = false
-			w.pool.releaseWorker(w)
-			if w.pool.addRunning(-1) == 0 && w.pool.IsClosed() {
-				w.pool.once.Do(func() {
-					close(w.pool.allDone)
-				})
-			}
-			w.pool.workerCache.Put(w)
-			// Call Signal() here in case there are goroutines waiting for available workers.
-			w.pool.cond.Signal()
-		}()
+	go w.loop()
+}
 
-		for fn := range w.task {
-			if fn == nil {
-				return
-			}
-			w.running = true
-			// 安全执行,崩溃要恢复并执行下一个任务
-			safeF := func() {
-				defer func() {
-					if p := recover(); p != nil {
-						if ph := w.pool.options.PanicHandler; ph != nil {
-							ph(p)
-						} else {
-							w.pool.options.Logger.Printf("id %d worker exits from panic: %v\n%s\n", w.id, p, debug.Stack())
-						}
-					}
-				}()
-				fn()
-			}
-			safeF()
-			if ok := w.pool.revertWorker(w); !ok {
-				return
-			}
-			w.running = false
+func (w *goWorkerWithID) loop() {
+	managedOwner := true
+	defer func() {
+		panicValue := recover()
+		if managedOwner {
+			w.pool.ownerExited(w)
+		}
+		if panicValue != nil {
+			w.pool.logWorkerPanic(w.entry.id, panicValue, debug.Stack())
 		}
 	}()
-}
 
-func (w *goWorkerWithID) finish() {
-	w.task <- nil
-}
+	for {
+		select {
+		case task := <-w.entry.tasks:
+			if !w.pool.startTask(w) {
+				managedOwner = false
+				<-w.escapeAnnounced
+				w.pool.escapedWorkerExited(w)
+				return
+			}
 
-func (w *goWorkerWithID) lastUsedTime() int64 {
-	// 针对常驻长时间运行任务，若保活且运行中则返回now,避免被回收
-	if w.keepAlive && w.running {
-		return w.pool.nowTime()
+			w.execute(task)
+			if w.pool.finishTask(w) {
+				managedOwner = false
+				<-w.escapeAnnounced
+				w.pool.escapedWorkerExited(w)
+				return
+			}
+			if hook := w.pool.testHooks.afterTaskFinished; hook != nil {
+				hook()
+			}
+			if w.pool.retireOwnerIfDrained(w) {
+				return
+			}
+
+		case <-w.stop:
+			return
+		}
 	}
-	return w.lastUsed
 }
 
-func (w *goWorkerWithID) inputFunc(fn func()) {
-	w.task <- fn
-}
-
-func (w *goWorkerWithID) setLastUsedTime(t int64) {
-	w.lastUsed = t
-}
-
-func (w *goWorkerWithID) inputArg(any) {
-	panic("unreachable")
+func (w *goWorkerWithID) execute(task func()) {
+	defer func() {
+		if p := recover(); p != nil {
+			w.pool.handleTaskPanic(w.entry.id, p, debug.Stack())
+		}
+	}()
+	task()
 }

@@ -39,19 +39,27 @@ func loadOptions(options ...Option) *Options {
 type Options struct {
 	// ExpiryDuration is a period for the scavenger goroutine to clean up those expired workers,
 	// the scavenger scans all workers every `ExpiryDuration` and clean up those workers that haven't been
-	// used for more than `ExpiryDuration`.
+	// used for more than `ExpiryDuration`. For PoolWithID it is also the running-task escape threshold:
+	// a replacement owner takes over the same ID queue after this duration unless running purge is disabled.
 	ExpiryDuration time.Duration
 
 	// PreAlloc indicates whether to make memory pre-allocation when initializing Pool.
+	// It is accepted but has no effect for PoolWithID.
 	PreAlloc bool
 
 	// Max number of goroutine blocking on pool.Submit.
 	// 0 (default value) means no such limit.
+	// For PoolWithID this only limits callers waiting for owner capacity for a
+	// new ID; it does not limit queue-space waits for an existing ID.
 	MaxBlockingTasks int
 
 	// When Nonblocking is true, Pool.Submit will never be blocked.
 	// ErrPoolOverload will be returned when Pool.Submit cannot be done at once.
 	// When Nonblocking is true, MaxBlockingTasks is inoperative.
+	// PoolWithID also returns ErrPoolOverload when an existing ID's observed
+	// queue length reaches TaskBuffer, or when its final nonblocking send finds
+	// the physical queue full. Concurrent submissions may use the reserved half
+	// of that queue because the admission check and send are not serialized.
 	Nonblocking bool
 
 	// PanicHandler is used to handle panics from each worker goroutine.
@@ -64,13 +72,23 @@ type Options struct {
 	// default standard logger from log package is used.
 	Logger Logger
 
-	// When DisablePurge is true, workers are not purged and are resident.
+	// When DisablePurge is true, workers are not purged and are resident. For
+	// PoolWithID this also disables automatic escape of long-running owners.
 	DisablePurge bool
 
-	// TaskBuffer 每个worker(goroutine)的task队列的大小，用于控制每个goroutine的背压,仅在 NewPoolWithID 有效
+	// TaskBuffer is the PoolWithID admission limit for each ID. The physical
+	// task channel has twice this capacity. Zero uses an admission limit of 10;
+	// negative values and values that overflow when doubled are rejected.
+	// Nonblocking submissions reject at this limit, while blocking submissions
+	// may use the full physical capacity and then wait for space or pool closure.
+	// MaxBlockingTasks does not limit this existing-ID wait, and a blocking task
+	// that recursively submits to its own full queue is not guaranteed to make
+	// progress.
 	TaskBuffer int
 
-	// DisablePurgeRunning 禁止回收正在运行的线程(即使超时),仅在 NewPoolWithID 有效
+	// DisablePurgeRunning prevents PoolWithID from escaping an owner whose task
+	// exceeds ExpiryDuration. A permanently blocked task can then block that ID
+	// permanently. This option has no effect on other pool types.
 	DisablePurgeRunning bool
 }
 
@@ -88,21 +106,26 @@ func WithExpiryDuration(expiryDuration time.Duration) Option {
 	}
 }
 
-// WithPreAlloc indicates whether it should malloc for workers.
+// WithPreAlloc indicates whether it should malloc for workers. PoolWithID
+// accepts this option but does not preallocate or reuse ID workers.
 func WithPreAlloc(preAlloc bool) Option {
 	return func(opts *Options) {
 		opts.PreAlloc = preAlloc
 	}
 }
 
-// WithMaxBlockingTasks sets up the maximum number of goroutines that are blocked when it reaches the capacity of pool.
+// WithMaxBlockingTasks sets up the maximum number of goroutines that are
+// blocked when a pool reaches owner capacity. For PoolWithID it does not apply
+// to queue-space waits for an ID that already exists.
 func WithMaxBlockingTasks(maxBlockingTasks int) Option {
 	return func(opts *Options) {
 		opts.MaxBlockingTasks = maxBlockingTasks
 	}
 }
 
-// WithNonblocking indicates that pool will return ErrPoolOverload when there is no available workers.
+// WithNonblocking indicates that pool submissions return ErrPoolOverload
+// instead of waiting. PoolWithID applies this to both new-ID owner capacity and
+// existing-ID queue admission.
 func WithNonblocking(nonblocking bool) Option {
 	return func(opts *Options) {
 		opts.Nonblocking = nonblocking
@@ -123,21 +146,30 @@ func WithLogger(logger Logger) Option {
 	}
 }
 
-// WithDisablePurge indicates whether we turn off automatically purge.
+// WithDisablePurge indicates whether we turn off automatic purge. It also
+// disables PoolWithID's automatic escape of long-running owners.
 func WithDisablePurge(disable bool) Option {
 	return func(opts *Options) {
 		opts.DisablePurge = disable
 	}
 }
 
-// WithDisablePurgeRunning 禁止回收正在运行的线程(即使超时),仅在 NewPoolWithID 有效.
+// WithDisablePurgeRunning controls whether PoolWithID replaces an owner whose
+// running task reaches ExpiryDuration. Setting disable to true turns off that
+// automatic recovery behavior.
 func WithDisablePurgeRunning(disable bool) Option {
 	return func(opts *Options) {
 		opts.DisablePurgeRunning = disable
 	}
 }
 
-// WithTaskBuffer 每个worker(goroutine)的task队列的大小，用于控制每个goroutine的背压,仅在 NewPoolWithID 有效.
+// WithTaskBuffer sets the PoolWithID admission limit for each ID. Its physical
+// task channel capacity is twice taskBuffer. In nonblocking mode, submissions
+// reject once the observed queue length reaches the admission limit and always
+// use a final nonblocking send. In blocking mode, submissions may use the full
+// channel and wait for space or closure; MaxBlockingTasks does not limit this
+// existing-ID wait. A task that recursively submits to its own full queue in
+// blocking mode is not guaranteed to make progress.
 func WithTaskBuffer(taskBuffer int) Option {
 	return func(opts *Options) {
 		opts.TaskBuffer = taskBuffer

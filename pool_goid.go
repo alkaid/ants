@@ -8,10 +8,10 @@
 // to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
 // copies of the Software, and to permit persons to whom the Software is
 // furnished to do so, subject to the following conditions:
-//
+
 // The above copyright notice and this permission notice shall be included in all
 // copies or substantial portions of the Software.
-//
+
 // THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
 // IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
 // FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
@@ -22,129 +22,614 @@
 
 package ants
 
-// MinTaskBuffer is the default task queue capacity for PoolWithID workers.
+import (
+	"context"
+	"errors"
+	"runtime/debug"
+	"sync"
+	"sync/atomic"
+	"time"
+)
+
+// MinTaskBuffer is the default admission limit for a PoolWithID task queue.
+// The physical queue capacity is twice this value.
 const MinTaskBuffer = 10
 
-// PoolWithID accepts the tasks from client, it limits the total of goroutines to a given number by recycling goroutines.
-//
-// 池子里的线程都带id, PoolWithID.Submit 到同一id线程的任务会在同一线程内保序执行,
-// 但业务方须注意任务的执行时间不能超过超时时间 WithExpiryDuration 否则可能产生脏线程及线程泄漏.
-// 若任务是耗时长的常驻循环任务,不希望所在线程被回收,请单独使用不回收的线程池,指定 WithDisablePurge(true).
+// poolWithIDBackgroundStartHook is a signal-only test seam. Production code
+// leaves it nil.
+var poolWithIDBackgroundStartHook func()
+
+// PoolWithID executes tasks for the same ID in FIFO start order. A task that
+// runs for ExpiryDuration may be escaped so a replacement owner can continue
+// consuming that ID's queue.
 type PoolWithID struct {
 	*poolCommon
+
+	registry       *workerIDRegistry
+	admissionLimit int
+	generation     atomic.Uint64
+
+	submitStop  chan struct{}
+	managedDone chan struct{}
+	closedDone  chan struct{}
+	managedOnce *sync.Once
+
+	purgeCancel   context.CancelFunc
+	purgeFinished chan struct{}
+	tickCancel    context.CancelFunc
+	tickFinished  chan struct{}
+
+	escape *poolWithIDEscapeState
+
+	testHooks poolWithIDTestHooks
 }
 
-// Submit submits a task to this pool.
-//
-// Submit 到同一id线程的任务会在同一线程内保序执行,
-// 但业务方须注意任务的执行时间不能超过超时时间 WithExpiryDuration 否则可能产生脏线程及线程泄漏.
-// 若任务是耗时长的常驻循环任务,不希望所在线程被回收,请单独使用不回收的线程池,指定 WithDisablePurge(true).
+type poolWithIDTestHooks struct {
+	afterAdmissionCheck            func()
+	afterSubmitRegistered          func()
+	afterCapacityWaitRegistered    func()
+	afterTaskFinished              func()
+	afterEscapeTransitionsRecorded func()
+	beforeEscapeSnapshotLock       func()
+	beforeReleaseLock              func()
+	afterReleaseLock               func()
+}
+
+// Submit registers task for id. In nonblocking mode, an existing ID is
+// rejected when its queue is already at TaskBuffer or when the final channel
+// send cannot complete immediately. In blocking mode, an existing ID may use
+// the full physical queue and waits for space or pool closure. MaxBlockingTasks
+// does not limit that existing-ID wait, and a task that recursively submits to
+// its own full queue in blocking mode is not guaranteed to make progress.
 func (p *PoolWithID) Submit(id int, task func()) error {
-	if p.IsClosed() {
+	generation := p.generation.Load()
+	entry, stop, err := p.registerSubmit(id, generation)
+	if err != nil {
+		return err
+	}
+
+	accepted := false
+	defer func() {
+		p.finishSubmit(entry, accepted)
+	}()
+
+	if p.options.Nonblocking {
+		if len(entry.tasks) >= p.admissionLimit {
+			return ErrPoolOverload
+		}
+		if hook := p.testHooks.afterAdmissionCheck; hook != nil {
+			hook()
+		}
+		select {
+		case entry.tasks <- task:
+			accepted = true
+			return nil
+		case <-stop:
+			return ErrPoolClosed
+		default:
+			return ErrPoolOverload
+		}
+	}
+
+	select {
+	case entry.tasks <- task:
+		accepted = true
+		return nil
+	case <-stop:
 		return ErrPoolClosed
 	}
-	w, err := p.retrieveWorker(id)
-	if w != nil {
-		// TODO 队列满且任务内容都是提交任务时必死锁,这里先用容量临时判断,若到达一半则异步提交。后续应该想办法从上下文获取当前线程池和id来对比判断是否要异步提交
-		gw := w.(*goWorkerWithID)
-		if len(gw.task) > p.options.TaskBuffer/2 {
-			err = Submit(func() {
-				w.inputFunc(task)
-			})
-			return err
-		}
-		w.inputFunc(task)
-	}
-	return err
 }
 
 // NewPoolWithID instantiates a PoolWithID with customized options.
+// TaskBuffer is normalized to a default admission limit of 10 when it is zero;
+// the physical per-ID queue has twice the configured admission capacity.
 func NewPoolWithID(size int, options ...Option) (*PoolWithID, error) {
-	pc, err := newPool(size, options...)
+	pc, err := newPoolCommon(size, false, options...)
 	if err != nil {
 		return nil, err
 	}
 
-	// 替换 workers 为带id的 workerMap
-	pc.workers = newWorkerMap()
-
-	pool := &PoolWithID{poolCommon: pc}
-
-	pool.workerCache.New = func() any {
-		return newWorkerWithGoID(pool)
+	limit := pc.options.TaskBuffer
+	maxInt := int(^uint(0) >> 1)
+	if limit == 0 {
+		limit = MinTaskBuffer
 	}
+	if limit < 0 || limit > maxInt/2 {
+		return nil, ErrInvalidPoolWithIDTaskBuffer
+	}
+	pc.options.TaskBuffer = limit
 
-	return pool, nil
+	p := &PoolWithID{
+		poolCommon:     pc,
+		registry:       newWorkerIDRegistry(),
+		admissionLimit: limit,
+		submitStop:     make(chan struct{}),
+		managedDone:    make(chan struct{}),
+		closedDone:     make(chan struct{}),
+		managedOnce:    &sync.Once{},
+		escape:         newPoolWithIDEscapeState(),
+		purgeFinished:  make(chan struct{}),
+		tickFinished:   make(chan struct{}),
+	}
+	p.generation.Store(1)
+	p.startIDBackgroundLocked()
+	return p, nil
 }
 
-// retrieveWorker returns an available worker to run the tasks.
-// 从 ants.go poolCommon.retrieveWorker 方法复制过来, 并修改为支持 id.
-func (p *PoolWithID) retrieveWorker(id int) (w worker, err error) {
+func (p *PoolWithID) registerSubmit(id int, generation uint64) (*workerIDEntry, <-chan struct{}, error) {
 	p.lock.Lock()
-
-retry:
-	// First try to fetch the worker from the queue.
-	if w = p.workers.(*workerMap).get(id, p.nowTime()); w != nil {
-		p.lock.Unlock()
-		return
-	}
-
-	// If the worker queue is empty, and we don't run out of the pool capacity,
-	// then just spawn a new worker goroutine.
-	if capacity := p.Cap(); capacity == -1 || capacity > p.Running() {
-		w = p.workerCache.Get().(*goWorkerWithID)
-		w.(*goWorkerWithID).id = id
-		w.(*goWorkerWithID).lastUsed = p.nowTime()
-		err = p.workers.(*workerMap).insert(w)
-		if err != nil {
-			panic(err)
+	for {
+		if atomic.LoadInt32(&p.state) != OPENED ||
+			p.generation.Load() != generation {
+			p.maybeManagedDoneLocked()
+			p.lock.Unlock()
+			return nil, nil, ErrPoolClosed
 		}
-		p.lock.Unlock()
-		w.run()
-		return
+
+		if entry := p.registry.items[id]; entry != nil {
+			entry.mu.Lock()
+			entry.pendingSubmits++
+			entry.outstanding++
+			entry.mu.Unlock()
+			stop := p.submitStop
+			p.lock.Unlock()
+			if hook := p.testHooks.afterSubmitRegistered; hook != nil {
+				hook()
+			}
+			return entry, stop, nil
+		}
+
+		if capacity := p.Cap(); capacity == -1 || p.Running() < capacity {
+			now := time.Now().UnixNano()
+			entry := newWorkerIDEntry(id, p.admissionLimit*2, now)
+			owner := newWorkerWithID(p, entry)
+			entry.owner = owner
+			entry.pendingSubmits = 1
+			entry.outstanding = 1
+			p.registry.items[id] = entry
+			p.addRunning(1)
+			owner.run()
+			stop := p.submitStop
+			p.lock.Unlock()
+			if hook := p.testHooks.afterSubmitRegistered; hook != nil {
+				hook()
+			}
+			return entry, stop, nil
+		}
+
+		if p.options.Nonblocking ||
+			(p.options.MaxBlockingTasks != 0 && p.Waiting() >= p.options.MaxBlockingTasks) {
+			p.lock.Unlock()
+			return nil, nil, ErrPoolOverload
+		}
+
+		p.addWaiting(1)
+		if hook := p.testHooks.afterCapacityWaitRegistered; hook != nil {
+			hook()
+		}
+		p.cond.Wait()
+		p.addWaiting(-1)
+		if atomic.LoadInt32(&p.state) != OPENED ||
+			p.generation.Load() != generation {
+			p.maybeManagedDoneLocked()
+			p.lock.Unlock()
+			return nil, nil, ErrPoolClosed
+		}
 	}
-
-	// Bail out early if it's in nonblocking mode or the number of pending callers reaches the maximum limit value.
-	if p.options.Nonblocking || (p.options.MaxBlockingTasks != 0 && p.Waiting() >= p.options.MaxBlockingTasks) {
-		p.lock.Unlock()
-		return nil, ErrPoolOverload
-	}
-
-	// Otherwise, we'll have to keep them blocked and wait for at least one worker to be put back into pool.
-	p.addWaiting(1)
-	p.cond.Wait() // block and wait for an available worker
-	p.addWaiting(-1)
-
-	if p.IsClosed() {
-		p.lock.Unlock()
-		return nil, ErrPoolClosed
-	}
-
-	goto retry
 }
 
-// revertWorker puts a worker back into free pool, recycling the goroutines.
-// 从 ants.go poolCommon.revertWorker 方法复制过来, 并修改为支持 id.
-func (p *PoolWithID) revertWorker(worker worker) bool {
-	if capacity := p.Cap(); (capacity > 0 && p.Running() > capacity) || p.IsClosed() {
-		p.cond.Broadcast()
+func (p *PoolWithID) finishSubmit(entry *workerIDEntry, accepted bool) {
+	entry.mu.Lock()
+	entry.pendingSubmits--
+	if !accepted {
+		entry.outstanding--
+	}
+	if entry.drained() {
+		entry.lastIdleAt = time.Now().UnixNano()
+	}
+	owner := entry.owner
+	entry.mu.Unlock()
+
+	if atomic.LoadInt32(&p.state) != OPENED {
+		p.retireEntryIfDrained(entry, owner)
+	}
+}
+
+func (p *PoolWithID) startTask(owner *goWorkerWithID) bool {
+	entry := owner.entry
+	entry.mu.Lock()
+	defer entry.mu.Unlock()
+	if entry.owner != owner {
 		return false
 	}
-
-	worker.setLastUsedTime(p.nowTime())
-
-	// 只保活 不用回收，因为本来就还在map里
-
+	if entry.outstanding > 0 {
+		entry.outstanding--
+	}
+	entry.taskStartedAt = time.Now().UnixNano()
 	return true
 }
 
-// releaseWorker releases a worker back into free pool, recycling the goroutines.
-// 新增
-//
-//	@receiver p
-//	@param w
-func (p *PoolWithID) releaseWorker(w *goWorkerWithID) {
+// finishTask returns true when owner was escaped while its task was running.
+func (p *PoolWithID) finishTask(owner *goWorkerWithID) bool {
+	entry := owner.entry
+	entry.mu.Lock()
+	defer entry.mu.Unlock()
+	if entry.owner != owner {
+		return true
+	}
+	entry.taskStartedAt = 0
+	entry.lastIdleAt = time.Now().UnixNano()
+	return false
+}
+
+func (p *PoolWithID) retireOwnerIfDrained(owner *goWorkerWithID) bool {
+	entry := owner.entry
 	p.lock.Lock()
-	p.workers.(*workerMap).detachWithID(w.id)
+	entry.mu.Lock()
+	state := atomic.LoadInt32(&p.state)
+	overCapacity := p.Cap() > 0 && p.Running() > p.Cap()
+	retired := (state != OPENED || overCapacity) &&
+		p.retireEntryLocked(entry, owner)
+	entry.mu.Unlock()
+	if retired {
+		p.cond.Broadcast()
+	}
+	p.maybeManagedDoneLocked()
 	p.lock.Unlock()
+	return retired
+}
+
+func (p *PoolWithID) retireEntryIfDrained(entry *workerIDEntry, owner *goWorkerWithID) bool {
+	p.lock.Lock()
+	entry.mu.Lock()
+	retired := p.retireEntryLocked(entry, owner)
+	entry.mu.Unlock()
+	if retired {
+		p.cond.Broadcast()
+	}
+	p.maybeManagedDoneLocked()
+	p.lock.Unlock()
+	return retired
+}
+
+// retireEntryLocked requires the registry lock followed by the entry lock.
+func (p *PoolWithID) retireEntryLocked(entry *workerIDEntry, owner *goWorkerWithID) bool {
+	if p.registry.items[entry.id] != entry || entry.owner != owner || !entry.drained() {
+		return false
+	}
+	delete(p.registry.items, entry.id)
+	close(owner.stop)
+	return true
+}
+
+func (p *PoolWithID) ownerExited(owner *goWorkerWithID) {
+	p.lock.Lock()
+	entry := owner.entry
+	entry.mu.Lock()
+	if entry.owner != owner {
+		entry.mu.Unlock()
+		p.lock.Unlock()
+		<-owner.escapeAnnounced
+		p.escapedWorkerExited(owner)
+		return
+	}
+	if p.registry.items[entry.id] == entry && entry.owner == owner {
+		entry.taskStartedAt = 0
+		entry.lastIdleAt = time.Now().UnixNano()
+		state := atomic.LoadInt32(&p.state)
+		overCapacity := p.Cap() > 0 && p.Running() > p.Cap()
+		if !entry.drained() || (state == OPENED && !overCapacity) {
+			replacement := newWorkerWithID(p, entry)
+			entry.owner = replacement
+			replacement.run()
+			entry.mu.Unlock()
+			p.lock.Unlock()
+			return
+		}
+		delete(p.registry.items, entry.id)
+		close(owner.stop)
+	}
+	entry.mu.Unlock()
+	p.addRunning(-1)
+	p.cond.Broadcast()
+	p.maybeManagedDoneLocked()
+	p.lock.Unlock()
+}
+
+func (p *PoolWithID) maybeManagedDoneLocked() {
+	if atomic.LoadInt32(&p.state) == CLOSING && len(p.registry.items) == 0 &&
+		p.Running() == 0 && p.Waiting() == 0 {
+		p.managedOnce.Do(func() { close(p.managedDone) })
+	}
+}
+
+// IsClosed reports whether the pool is closing or fully closed.
+func (p *PoolWithID) IsClosed() bool {
+	return atomic.LoadInt32(&p.state) != OPENED
+}
+
+// Release stops accepting submissions and starts draining accepted work. It
+// returns after the close transition and wakeups have been issued.
+func (p *PoolWithID) Release() {
+	_, _ = p.startRelease()
+}
+
+// ReleaseTimeout starts or joins the current release and waits for managed
+// owners and accepted queues to drain until timeout. Escaped workers are not
+// included in this wait.
+func (p *PoolWithID) ReleaseTimeout(timeout time.Duration) error {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	err := p.ReleaseContext(ctx)
+	if errors.Is(err, context.DeadlineExceeded) {
+		return ErrTimeout
+	}
+	return err
+}
+
+// ReleaseContext starts or joins the current release and waits until the pool
+// is fully closed. A nil context initiates release without waiting.
+func (p *PoolWithID) ReleaseContext(ctx context.Context) error {
+	done, closed := p.startRelease()
+	if closed {
+		return ErrPoolClosed
+	}
+	if ctx == nil {
+		return nil
+	}
+	select {
+	case <-done:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (p *PoolWithID) startRelease() (<-chan struct{}, bool) {
+	if hook := p.testHooks.beforeReleaseLock; hook != nil {
+		hook()
+	}
+	p.lock.Lock()
+	state := atomic.LoadInt32(&p.state)
+	if state == CLOSED {
+		done := p.closedDone
+		p.lock.Unlock()
+		return done, true
+	}
+	if state == CLOSING {
+		done := p.closedDone
+		p.lock.Unlock()
+		return done, false
+	}
+	if hook := p.testHooks.afterReleaseLock; hook != nil {
+		hook()
+	}
+
+	atomic.StoreInt32(&p.state, CLOSING)
+	close(p.submitStop)
+
+	for _, entry := range p.registry.items {
+		entry.mu.Lock()
+		p.retireEntryLocked(entry, entry.owner)
+		entry.mu.Unlock()
+	}
+	p.cond.Broadcast()
+	p.maybeManagedDoneLocked()
+
+	managedDone := p.managedDone
+	purgeFinished := p.purgeFinished
+	tickFinished := p.tickFinished
+	closedDone := p.closedDone
+	p.lock.Unlock()
+
+	go p.awaitClosed(managedDone, purgeFinished, tickFinished, closedDone)
+	return closedDone, false
+}
+
+func (p *PoolWithID) awaitClosed(managedDone, purgeFinished, tickFinished, closedDone chan struct{}) {
+	<-managedDone
+
+	p.lock.Lock()
+	purgeCancel := p.purgeCancel
+	p.purgeCancel = nil
+	tickCancel := p.tickCancel
+	p.tickCancel = nil
+	p.lock.Unlock()
+	if purgeCancel != nil {
+		purgeCancel()
+	}
+	if tickCancel != nil {
+		tickCancel()
+	}
+
+	<-purgeFinished
+	<-tickFinished
+
+	p.lock.Lock()
+	if atomic.LoadInt32(&p.state) == CLOSING && p.closedDone == closedDone {
+		atomic.StoreInt32(&p.state, CLOSED)
+		close(closedDone)
+	}
+	p.lock.Unlock()
+}
+
+// Reboot waits for an in-progress managed drain, then opens a new empty ID
+// registry. Escape events and snapshots remain continuous across the reboot.
+func (p *PoolWithID) Reboot() {
+	for {
+		p.lock.Lock()
+		state := atomic.LoadInt32(&p.state)
+		if state == OPENED {
+			p.lock.Unlock()
+			return
+		}
+		if state == CLOSING {
+			done := p.closedDone
+			p.lock.Unlock()
+			<-done
+			continue
+		}
+
+		p.registry = newWorkerIDRegistry()
+		p.submitStop = make(chan struct{})
+		p.managedDone = make(chan struct{})
+		p.closedDone = make(chan struct{})
+		p.managedOnce = &sync.Once{}
+		p.generation.Add(1)
+		atomic.StoreInt32(&p.state, OPENED)
+		p.startIDBackgroundLocked()
+		p.lock.Unlock()
+		return
+	}
+}
+
+// Tune changes the owner capacity for PoolWithID. PreAlloc is intentionally a
+// no-op for this pool and therefore does not disable tuning.
+func (p *PoolWithID) Tune(size int) {
+	capacity := p.Cap()
+	if capacity == -1 || size <= 0 || size == capacity {
+		return
+	}
+	atomic.StoreInt32(&p.capacity, int32(size))
+	if size > capacity {
+		p.cond.Broadcast()
+	}
+}
+
+func (p *PoolWithID) startIDBackgroundLocked() {
+	if hook := poolWithIDBackgroundStartHook; hook != nil {
+		hook()
+	}
+	atomic.StoreInt64(&p.now, time.Now().UnixNano())
+
+	tickCtx, tickCancel := context.WithCancel(context.Background())
+	p.tickCancel = tickCancel
+	p.tickFinished = make(chan struct{})
+	go p.tickIDClock(tickCtx, p.tickFinished)
+
+	p.purgeFinished = make(chan struct{})
+	if p.options.DisablePurge {
+		close(p.purgeFinished)
+		p.purgeCancel = nil
+		return
+	}
+	purgeCtx, purgeCancel := context.WithCancel(context.Background())
+	p.purgeCancel = purgeCancel
+	go p.purgeIDs(purgeCtx, p.purgeFinished)
+}
+
+func (p *PoolWithID) tickIDClock(ctx context.Context, finished chan struct{}) {
+	ticker := time.NewTicker(nowTimeUpdateInterval)
+	defer func() {
+		ticker.Stop()
+		close(finished)
+	}()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case now := <-ticker.C:
+			atomic.StoreInt64(&p.now, now.UnixNano())
+		}
+	}
+}
+
+func (p *PoolWithID) purgeIDs(ctx context.Context, finished chan struct{}) {
+	ticker := time.NewTicker(p.options.ExpiryDuration)
+	defer func() {
+		ticker.Stop()
+		close(finished)
+	}()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case now := <-ticker.C:
+			p.purgeExpired(now.UnixNano())
+		}
+	}
+}
+
+// purgeExpired is separated from the ticker so lifecycle races can be tested
+// with a synthetic time and explicit synchronization.
+func (p *PoolWithID) purgeExpired(now int64) {
+	if p.options.DisablePurge {
+		return
+	}
+
+	type transition struct {
+		worker *goWorkerWithID
+		id     int
+		event  PoolWithIDEscapeEvent
+	}
+	var transitions []transition
+
+	p.escape.transitionMu.Lock()
+	p.lock.Lock()
+	state := atomic.LoadInt32(&p.state)
+	if state == CLOSED {
+		p.lock.Unlock()
+		p.escape.transitionMu.Unlock()
+		return
+	}
+
+	expiry := int64(p.options.ExpiryDuration)
+	for _, entry := range p.registry.items {
+		entry.mu.Lock()
+		if entry.taskStartedAt != 0 {
+			if !p.options.DisablePurgeRunning && now-entry.taskStartedAt >= expiry {
+				oldOwner := entry.owner
+				newOwner := newWorkerWithID(p, entry)
+				entry.owner = newOwner
+				entry.taskStartedAt = 0
+				entry.lastIdleAt = now
+				newOwner.run()
+				transitions = append(transitions, transition{worker: oldOwner, id: entry.id})
+				if state == CLOSING && entry.drained() {
+					p.retireEntryLocked(entry, newOwner)
+				}
+			}
+		} else if entry.drained() && (state == CLOSING || now-entry.lastIdleAt >= expiry) {
+			p.retireEntryLocked(entry, entry.owner)
+		}
+		entry.mu.Unlock()
+	}
+	p.lock.Unlock()
+	for i := range transitions {
+		transitions[i].event = p.recordWorkerEscaped(transitions[i].id)
+	}
+	if hook := p.testHooks.afterEscapeTransitionsRecorded; hook != nil {
+		hook()
+	}
+
+	for _, item := range transitions {
+		p.publishEscapeEvent(item.event)
+	}
+	for _, item := range transitions {
+		close(item.worker.escapeAnnounced)
+	}
+	p.escape.transitionMu.Unlock()
+	for _, item := range transitions {
+		p.logEscapeEvent(item.event)
+	}
+}
+
+func (p *PoolWithID) handleTaskPanic(id int, panicValue any, stack []byte) {
+	if handler := p.options.PanicHandler; handler != nil {
+		func() {
+			defer func() {
+				if nested := recover(); nested != nil {
+					p.logWorkerPanic(id, nested, debug.Stack())
+				}
+			}()
+			handler(panicValue)
+		}()
+		return
+	}
+	p.logWorkerPanic(id, panicValue, stack)
+}
+
+func (p *PoolWithID) logWorkerPanic(id int, panicValue any, stack []byte) {
+	defer func() { _ = recover() }()
+	p.options.Logger.Printf("id %d worker recovers from panic: %v\n%s\n", id, panicValue, stack)
 }

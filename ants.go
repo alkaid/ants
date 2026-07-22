@@ -57,6 +57,10 @@ const (
 
 	// CLOSED represents that the pool is closed.
 	CLOSED
+
+	// CLOSING represents that the pool no longer accepts submissions and is
+	// draining work that was already accepted. It is used by PoolWithID.
+	CLOSING
 )
 
 var (
@@ -74,6 +78,10 @@ var (
 
 	// ErrInvalidPreAllocSize will be returned when trying to set up a negative capacity under PreAlloc mode.
 	ErrInvalidPreAllocSize = errors.New("can not set up a negative capacity under PreAlloc mode")
+
+	// ErrInvalidPoolWithIDTaskBuffer is returned when the PoolWithID admission
+	// limit is negative or too large to allocate its bounded task queue.
+	ErrInvalidPoolWithIDTaskBuffer = errors.New("invalid task buffer for PoolWithID")
 
 	// ErrTimeout will be returned after the operations timed out.
 	ErrTimeout = errors.New("operation timed out")
@@ -205,6 +213,18 @@ type poolCommon struct {
 }
 
 func newPool(size int, options ...Option) (*poolCommon, error) {
+	p, err := newPoolCommon(size, true, options...)
+	if err != nil {
+		return nil, err
+	}
+	p.startBackground()
+	return p, nil
+}
+
+// newPoolCommon allocates and configures a pool without starting background
+// goroutines. Specialized pools must finish initializing their own scheduler
+// before they start scavenging or timekeeping.
+func newPoolCommon(size int, allocateWorkerQueue bool, options ...Option) (*poolCommon, error) {
 	if size <= 0 {
 		size = -1
 	}
@@ -230,21 +250,22 @@ func newPool(size int, options ...Option) (*poolCommon, error) {
 		once:     &sync.Once{},
 		options:  opts,
 	}
-	if p.options.PreAlloc {
+	if allocateWorkerQueue && p.options.PreAlloc {
 		if size == -1 {
 			return nil, ErrInvalidPreAllocSize
 		}
 		p.workers = newWorkerQueue(queueTypeLoopQueue, size)
-	} else {
+	} else if allocateWorkerQueue {
 		p.workers = newWorkerQueue(queueTypeStack, 0)
 	}
 
 	p.cond = sync.NewCond(p.lock)
+	return p, nil
+}
 
+func (p *poolCommon) startBackground() {
 	p.goPurge()
 	p.goTicktock()
-
-	return p, nil
 }
 
 // purgeStaleWorkers clears stale workers periodically, it runs in an individual goroutine, as a scavenger.
