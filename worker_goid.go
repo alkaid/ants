@@ -46,7 +46,7 @@ type goWorkerWithID struct {
 	keepAlive bool // 针对常驻长时间运行任务须为true
 }
 
-func newWorkerWithGoId(pool *PoolWithID) *goWorkerWithID {
+func newWorkerWithGoID(pool *PoolWithID) *goWorkerWithID {
 	// 设置 task buffer
 	taskBuffer := pool.options.TaskBuffer
 	if taskBuffer == 0 {

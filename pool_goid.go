@@ -22,13 +22,14 @@
 
 package ants
 
+// MinTaskBuffer is the default task queue capacity for PoolWithID workers.
 const MinTaskBuffer = 10
 
 // PoolWithID accepts the tasks from client, it limits the total of goroutines to a given number by recycling goroutines.
 //
 // 池子里的线程都带id, PoolWithID.Submit 到同一id线程的任务会在同一线程内保序执行,
 // 但业务方须注意任务的执行时间不能超过超时时间 WithExpiryDuration 否则可能产生脏线程及线程泄漏.
-// 若任务是耗时长的常驻循环任务,不希望所在线程被回收,请单独使用不回收的线程池,指定 WithDisablePurge(true)
+// 若任务是耗时长的常驻循环任务,不希望所在线程被回收,请单独使用不回收的线程池,指定 WithDisablePurge(true).
 type PoolWithID struct {
 	*poolCommon
 }
@@ -37,7 +38,7 @@ type PoolWithID struct {
 //
 // Submit 到同一id线程的任务会在同一线程内保序执行,
 // 但业务方须注意任务的执行时间不能超过超时时间 WithExpiryDuration 否则可能产生脏线程及线程泄漏.
-// 若任务是耗时长的常驻循环任务,不希望所在线程被回收,请单独使用不回收的线程池,指定 WithDisablePurge(true)
+// 若任务是耗时长的常驻循环任务,不希望所在线程被回收,请单独使用不回收的线程池,指定 WithDisablePurge(true).
 func (p *PoolWithID) Submit(id int, task func()) error {
 	if p.IsClosed() {
 		return ErrPoolClosed
@@ -65,19 +66,19 @@ func NewPoolWithID(size int, options ...Option) (*PoolWithID, error) {
 	}
 
 	// 替换 workers 为带id的 workerMap
-	pc.workers = newWorkerMap(0)
+	pc.workers = newWorkerMap()
 
 	pool := &PoolWithID{poolCommon: pc}
 
 	pool.workerCache.New = func() any {
-		return newWorkerWithGoId(pool)
+		return newWorkerWithGoID(pool)
 	}
 
 	return pool, nil
 }
 
 // retrieveWorker returns an available worker to run the tasks.
-// 从 ants.go poolCommon.retrieveWorker 方法复制过来, 并修改为支持 id
+// 从 ants.go poolCommon.retrieveWorker 方法复制过来, 并修改为支持 id.
 func (p *PoolWithID) retrieveWorker(id int) (w worker, err error) {
 	p.lock.Lock()
 
@@ -123,7 +124,7 @@ retry:
 }
 
 // revertWorker puts a worker back into free pool, recycling the goroutines.
-// 从 ants.go poolCommon.revertWorker 方法复制过来, 并修改为支持 id
+// 从 ants.go poolCommon.revertWorker 方法复制过来, 并修改为支持 id.
 func (p *PoolWithID) revertWorker(worker worker) bool {
 	if capacity := p.Cap(); (capacity > 0 && p.Running() > capacity) || p.IsClosed() {
 		p.cond.Broadcast()

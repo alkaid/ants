@@ -12,8 +12,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Check target branch
+        env:
+          HEAD_REF: ${{ github.head_ref }}
         run: |
-          if [ ${{ github.head_ref }} != "dev" ]; then
+          if [ "$HEAD_REF" != "dev" ]; then
             echo "Only pull requests from dev branch are only allowed to be merged into master branch."
             exit 1
           fi

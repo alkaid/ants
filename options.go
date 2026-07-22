@@ -130,14 +130,14 @@ func WithDisablePurge(disable bool) Option {
 	}
 }
 
-// WithDisablePurgeRunning 禁止回收正在运行的线程(即使超时),仅在 NewPoolWithID 有效
+// WithDisablePurgeRunning 禁止回收正在运行的线程(即使超时),仅在 NewPoolWithID 有效.
 func WithDisablePurgeRunning(disable bool) Option {
 	return func(opts *Options) {
 		opts.DisablePurgeRunning = disable
 	}
 }
 
-// WithTaskBuffer 每个worker(goroutine)的task队列的大小，用于控制每个goroutine的背压,仅在 NewPoolWithID 有效
+// WithTaskBuffer 每个worker(goroutine)的task队列的大小，用于控制每个goroutine的背压,仅在 NewPoolWithID 有效.
 func WithTaskBuffer(taskBuffer int) Option {
 	return func(opts *Options) {
 		opts.TaskBuffer = taskBuffer

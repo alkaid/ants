@@ -10,7 +10,7 @@ type workerMap struct {
 	expiry []worker
 }
 
-func newWorkerMap(size int) *workerMap {
+func newWorkerMap() *workerMap {
 	return &workerMap{
 		items: map[int]worker{},
 	}
