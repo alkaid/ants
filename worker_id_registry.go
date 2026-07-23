@@ -1,24 +1,35 @@
 package ants
 
-import "sync"
+import (
+	"sync"
+
+	syncx "github.com/alkaid/ants/v2/pkg/sync"
+)
 
 // workerIDRegistry owns stable per-ID entries. Its map is protected by the
 // PoolWithID registry lock; entry state has a narrower lock for submissions and
 // worker state transitions.
 type workerIDRegistry struct {
-	items map[int]*workerIDEntry
+	items    map[int]*workerIDEntry
+	expiryMu sync.Locker
+	idle     workerIDEntryList
+	running  workerIDEntryList
 }
 
 func newWorkerIDRegistry() *workerIDRegistry {
-	return &workerIDRegistry{items: make(map[int]*workerIDEntry)}
+	return &workerIDRegistry{
+		items:    make(map[int]*workerIDEntry),
+		expiryMu: syncx.NewSpinLock(),
+	}
 }
 
 type workerIDEntry struct {
 	mu sync.Mutex
 
-	id    int
-	tasks chan func()
-	owner *goWorkerWithID
+	registry *workerIDRegistry
+	id       int
+	tasks    chan func()
+	owner    *goWorkerWithID
 
 	// pendingSubmits counts callers that registered while the pool was open but
 	// have not yet completed their channel send attempt. outstanding counts
@@ -29,10 +40,33 @@ type workerIDEntry struct {
 
 	taskStartedAt int64
 	lastIdleAt    int64
+	expiryPending bool
+
+	expiryPrev *workerIDEntry
+	expiryNext *workerIDEntry
+	expiryList workerIDEntryListKind
 }
 
-func newWorkerIDEntry(id, taskCapacity int, now int64) *workerIDEntry {
+type workerIDEntryListKind uint8
+
+const (
+	workerIDEntryListNone workerIDEntryListKind = iota
+	workerIDEntryListIdle
+	workerIDEntryListRunning
+)
+
+type workerIDEntryList struct {
+	head *workerIDEntry
+	tail *workerIDEntry
+}
+
+func newWorkerIDEntry(
+	registry *workerIDRegistry,
+	id, taskCapacity int,
+	now int64,
+) *workerIDEntry {
 	return &workerIDEntry{
+		registry:   registry,
 		id:         id,
 		tasks:      make(chan func(), taskCapacity),
 		lastIdleAt: now,
@@ -40,5 +74,56 @@ func newWorkerIDEntry(id, taskCapacity int, now int64) *workerIDEntry {
 }
 
 func (e *workerIDEntry) drained() bool {
-	return e.pendingSubmits == 0 && e.outstanding == 0 && e.taskStartedAt == 0
+	return e.pendingSubmits == 0 && e.outstanding == 0 &&
+		e.taskStartedAt == 0 && !e.expiryPending
+}
+
+// removeExpiry requires expiryMu.
+func (r *workerIDRegistry) removeExpiry(entry *workerIDEntry) {
+	if entry.expiryList == workerIDEntryListNone {
+		return
+	}
+	list := &r.idle
+	if entry.expiryList == workerIDEntryListRunning {
+		list = &r.running
+	}
+	if entry.expiryPrev == nil {
+		list.head = entry.expiryNext
+	} else {
+		entry.expiryPrev.expiryNext = entry.expiryNext
+	}
+	if entry.expiryNext == nil {
+		list.tail = entry.expiryPrev
+	} else {
+		entry.expiryNext.expiryPrev = entry.expiryPrev
+	}
+	entry.expiryPrev = nil
+	entry.expiryNext = nil
+	entry.expiryList = workerIDEntryListNone
+}
+
+// appendIdle requires expiryMu and the entry lock.
+func (r *workerIDRegistry) appendIdle(entry *workerIDEntry) {
+	r.appendExpiry(entry, workerIDEntryListIdle, &r.idle)
+}
+
+// appendRunning requires expiryMu and the entry lock.
+func (r *workerIDRegistry) appendRunning(entry *workerIDEntry) {
+	r.appendExpiry(entry, workerIDEntryListRunning, &r.running)
+}
+
+func (r *workerIDRegistry) appendExpiry(
+	entry *workerIDEntry,
+	kind workerIDEntryListKind,
+	list *workerIDEntryList,
+) {
+	r.removeExpiry(entry)
+	entry.expiryPrev = list.tail
+	entry.expiryList = kind
+	if list.tail == nil {
+		list.head = entry
+	} else {
+		list.tail.expiryNext = entry
+	}
+	list.tail = entry
 }

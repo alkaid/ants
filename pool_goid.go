@@ -81,6 +81,7 @@ type poolWithIDTestHooks struct {
 	afterSubmitRegistered          func()
 	afterCapacityWaitRegistered    func()
 	afterTaskFinished              func()
+	afterPurgeEntryVisited         func()
 	afterEscapeTransitionsRecorded func()
 	beforeEscapeSnapshotLock       func()
 	beforeReleaseLock              func()
@@ -208,12 +209,13 @@ func (p *PoolWithID) registerSubmit(id int, generation uint64) (*workerIDEntry, 
 
 		if capacity := p.Cap(); capacity == -1 || p.Running() < capacity {
 			now := time.Now().UnixNano()
-			entry := newWorkerIDEntry(id, p.admissionLimit*2, now)
+			registry := p.registry
+			entry := newWorkerIDEntry(registry, id, p.admissionLimit*2, now)
 			owner := newWorkerWithID(p, entry)
 			entry.owner = owner
 			entry.pendingSubmits = 1
 			entry.outstanding = 1
-			p.registry.items[id] = entry
+			registry.items[id] = entry
 			p.addRunning(1)
 			owner.run()
 			stop := p.submitStop
@@ -251,11 +253,27 @@ func (p *PoolWithID) finishSubmit(entry *workerIDEntry, accepted bool) {
 	if !accepted {
 		entry.outstanding--
 	}
-	if entry.drained() {
-		entry.lastIdleAt = time.Now().UnixNano()
+	idleCandidate := entry.pendingSubmits == 0 && entry.outstanding == 0 &&
+		entry.taskStartedAt == 0
+	if idleCandidate {
+		entry.expiryPending = true
 	}
 	owner := entry.owner
 	entry.mu.Unlock()
+
+	if idleCandidate {
+		registry := entry.registry
+		registry.expiryMu.Lock()
+		entry.mu.Lock()
+		entry.expiryPending = false
+		if entry.drained() {
+			entry.lastIdleAt = time.Now().UnixNano()
+			registry.appendIdle(entry)
+		}
+		owner = entry.owner
+		entry.mu.Unlock()
+		registry.expiryMu.Unlock()
+	}
 
 	if atomic.LoadInt32(&p.state) != OPENED {
 		p.retireEntryIfDrained(entry, owner)
@@ -264,40 +282,59 @@ func (p *PoolWithID) finishSubmit(entry *workerIDEntry, accepted bool) {
 
 func (p *PoolWithID) startTask(owner *goWorkerWithID) bool {
 	entry := owner.entry
+	registry := entry.registry
+	registry.expiryMu.Lock()
+	defer registry.expiryMu.Unlock()
 	entry.mu.Lock()
 	defer entry.mu.Unlock()
 	if entry.owner != owner {
 		return false
 	}
+	registry.removeExpiry(entry)
 	if entry.outstanding > 0 {
 		entry.outstanding--
 	}
 	entry.taskStartedAt = time.Now().UnixNano()
+	registry.appendRunning(entry)
 	return true
 }
 
 // finishTask returns true when owner was escaped while its task was running.
 func (p *PoolWithID) finishTask(owner *goWorkerWithID) bool {
 	entry := owner.entry
+	registry := entry.registry
+	registry.expiryMu.Lock()
+	defer registry.expiryMu.Unlock()
 	entry.mu.Lock()
 	defer entry.mu.Unlock()
 	if entry.owner != owner {
 		return true
 	}
+	registry.removeExpiry(entry)
 	entry.taskStartedAt = 0
 	entry.lastIdleAt = time.Now().UnixNano()
+	if entry.drained() {
+		registry.appendIdle(entry)
+	}
 	return false
 }
 
 func (p *PoolWithID) retireOwnerIfDrained(owner *goWorkerWithID) bool {
 	entry := owner.entry
 	p.lock.Lock()
-	entry.mu.Lock()
 	state := atomic.LoadInt32(&p.state)
 	overCapacity := p.Cap() > 0 && p.Running() > p.Cap()
-	retired := (state != OPENED || overCapacity) &&
-		p.retireEntryLocked(entry, owner)
+	if state == OPENED && !overCapacity {
+		p.maybeManagedDoneLocked()
+		p.lock.Unlock()
+		return false
+	}
+	registry := entry.registry
+	registry.expiryMu.Lock()
+	entry.mu.Lock()
+	retired := p.retireEntryLocked(entry, owner)
 	entry.mu.Unlock()
+	registry.expiryMu.Unlock()
 	if retired {
 		p.cond.Broadcast()
 	}
@@ -308,9 +345,12 @@ func (p *PoolWithID) retireOwnerIfDrained(owner *goWorkerWithID) bool {
 
 func (p *PoolWithID) retireEntryIfDrained(entry *workerIDEntry, owner *goWorkerWithID) bool {
 	p.lock.Lock()
+	registry := entry.registry
+	registry.expiryMu.Lock()
 	entry.mu.Lock()
 	retired := p.retireEntryLocked(entry, owner)
 	entry.mu.Unlock()
+	registry.expiryMu.Unlock()
 	if retired {
 		p.cond.Broadcast()
 	}
@@ -319,12 +359,24 @@ func (p *PoolWithID) retireEntryIfDrained(entry *workerIDEntry, owner *goWorkerW
 	return retired
 }
 
-// retireEntryLocked requires the registry lock followed by the entry lock.
-func (p *PoolWithID) retireEntryLocked(entry *workerIDEntry, owner *goWorkerWithID) bool {
-	if p.registry.items[entry.id] != entry || entry.owner != owner || !entry.drained() {
+// detachEntryLocked requires the pool lock, expiryMu, and the entry lock. It
+// removes scheduler ownership without waking the owner.
+func (p *PoolWithID) detachEntryLocked(entry *workerIDEntry, owner *goWorkerWithID) bool {
+	registry := entry.registry
+	if p.registry != registry || registry.items[entry.id] != entry ||
+		entry.owner != owner || !entry.drained() {
 		return false
 	}
-	delete(p.registry.items, entry.id)
+	registry.removeExpiry(entry)
+	delete(registry.items, entry.id)
+	return true
+}
+
+// retireEntryLocked requires the pool lock, expiryMu, and the entry lock.
+func (p *PoolWithID) retireEntryLocked(entry *workerIDEntry, owner *goWorkerWithID) bool {
+	if !p.detachEntryLocked(entry, owner) {
+		return false
+	}
 	close(owner.stop)
 	return true
 }
@@ -332,15 +384,19 @@ func (p *PoolWithID) retireEntryLocked(entry *workerIDEntry, owner *goWorkerWith
 func (p *PoolWithID) ownerExited(owner *goWorkerWithID) {
 	p.lock.Lock()
 	entry := owner.entry
+	registry := entry.registry
+	registry.expiryMu.Lock()
 	entry.mu.Lock()
 	if entry.owner != owner {
 		entry.mu.Unlock()
+		registry.expiryMu.Unlock()
 		p.lock.Unlock()
 		<-owner.escapeAnnounced
 		p.escapedWorkerExited(owner)
 		return
 	}
-	if p.registry.items[entry.id] == entry && entry.owner == owner {
+	if p.registry == registry && registry.items[entry.id] == entry && entry.owner == owner {
+		registry.removeExpiry(entry)
 		entry.taskStartedAt = 0
 		entry.lastIdleAt = time.Now().UnixNano()
 		state := atomic.LoadInt32(&p.state)
@@ -348,15 +404,20 @@ func (p *PoolWithID) ownerExited(owner *goWorkerWithID) {
 		if !entry.drained() || (state == OPENED && !overCapacity) {
 			replacement := newWorkerWithID(p, entry)
 			entry.owner = replacement
+			if entry.drained() {
+				registry.appendIdle(entry)
+			}
 			replacement.run()
 			entry.mu.Unlock()
+			registry.expiryMu.Unlock()
 			p.lock.Unlock()
 			return
 		}
-		delete(p.registry.items, entry.id)
+		delete(registry.items, entry.id)
 		close(owner.stop)
 	}
 	entry.mu.Unlock()
+	registry.expiryMu.Unlock()
 	p.addRunning(-1)
 	p.cond.Broadcast()
 	p.maybeManagedDoneLocked()
@@ -440,11 +501,13 @@ func (p *PoolWithID) startRelease() (<-chan struct{}, bool) {
 	atomic.StoreInt32(&p.state, CLOSING)
 	close(p.submitStop)
 
+	p.registry.expiryMu.Lock()
 	for _, entry := range p.registry.items {
 		entry.mu.Lock()
 		p.retireEntryLocked(entry, entry.owner)
 		entry.mu.Unlock()
 	}
+	p.registry.expiryMu.Unlock()
 	p.cond.Broadcast()
 	p.maybeManagedDoneLocked()
 
@@ -593,43 +656,98 @@ func (p *PoolWithID) purgeExpired(now int64) {
 	}
 
 	type transition struct {
-		worker *goWorkerWithID
-		id     int
-		event  PoolWithIDEscapeEvent
+		worker      *goWorkerWithID
+		replacement *goWorkerWithID
+		id          int
+		event       PoolWithIDEscapeEvent
 	}
 	var transitions []transition
+	var ownersToStop []*goWorkerWithID
 
 	p.escape.transitionMu.Lock()
 	p.lock.Lock()
+	p.registry.expiryMu.Lock()
 	state := atomic.LoadInt32(&p.state)
 	if state == CLOSED {
+		p.registry.expiryMu.Unlock()
 		p.lock.Unlock()
 		p.escape.transitionMu.Unlock()
 		return
 	}
 
 	expiry := int64(p.options.ExpiryDuration)
-	for _, entry := range p.registry.items {
+	for entry := p.registry.idle.head; entry != nil; entry = p.registry.idle.head {
+		if hook := p.testHooks.afterPurgeEntryVisited; hook != nil {
+			hook()
+		}
 		entry.mu.Lock()
-		if entry.taskStartedAt != 0 {
-			if !p.options.DisablePurgeRunning && now-entry.taskStartedAt >= expiry {
-				oldOwner := entry.owner
-				newOwner := newWorkerWithID(p, entry)
-				entry.owner = newOwner
-				entry.taskStartedAt = 0
-				entry.lastIdleAt = now
-				newOwner.run()
-				transitions = append(transitions, transition{worker: oldOwner, id: entry.id})
-				if state == CLOSING && entry.drained() {
-					p.retireEntryLocked(entry, newOwner)
-				}
-			}
-		} else if entry.drained() && (state == CLOSING || now-entry.lastIdleAt >= expiry) {
-			p.retireEntryLocked(entry, entry.owner)
+		if !entry.drained() {
+			p.registry.removeExpiry(entry)
+			entry.mu.Unlock()
+			continue
+		}
+		if state != CLOSING && now-entry.lastIdleAt < expiry {
+			entry.mu.Unlock()
+			break
+		}
+		owner := entry.owner
+		if p.detachEntryLocked(entry, owner) {
+			ownersToStop = append(ownersToStop, owner)
 		}
 		entry.mu.Unlock()
 	}
+
+	if !p.options.DisablePurgeRunning {
+		for entry := p.registry.running.head; entry != nil; entry = p.registry.running.head {
+			if hook := p.testHooks.afterPurgeEntryVisited; hook != nil {
+				hook()
+			}
+			entry.mu.Lock()
+			if entry.taskStartedAt == 0 {
+				p.registry.removeExpiry(entry)
+				if entry.drained() {
+					p.registry.appendIdle(entry)
+				}
+				entry.mu.Unlock()
+				continue
+			}
+			if now-entry.taskStartedAt < expiry {
+				entry.mu.Unlock()
+				break
+			}
+
+			oldOwner := entry.owner
+			newOwner := newWorkerWithID(p, entry)
+			p.registry.removeExpiry(entry)
+			entry.owner = newOwner
+			entry.taskStartedAt = 0
+			entry.lastIdleAt = now
+			if entry.drained() {
+				if state == CLOSING {
+					if p.detachEntryLocked(entry, newOwner) {
+						ownersToStop = append(ownersToStop, newOwner)
+					}
+				} else {
+					p.registry.appendIdle(entry)
+				}
+			}
+			transitions = append(transitions, transition{
+				worker:      oldOwner,
+				replacement: newOwner,
+				id:          entry.id,
+			})
+			entry.mu.Unlock()
+		}
+	}
+	p.registry.expiryMu.Unlock()
 	p.lock.Unlock()
+
+	for _, owner := range ownersToStop {
+		close(owner.stop)
+	}
+	for _, item := range transitions {
+		item.replacement.run()
+	}
 	for i := range transitions {
 		transitions[i].event = p.recordWorkerEscaped(transitions[i].id)
 	}
