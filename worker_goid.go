@@ -32,19 +32,16 @@ import (
 type goWorkerWithID struct {
 	pool  *PoolWithID
 	entry *workerIDEntry
-	stop  chan struct{}
-
-	// escapeAnnounced preserves start-before-exit ordering on the event stream
-	// without holding scheduler locks while publishing or logging.
-	escapeAnnounced chan struct{}
+	// stop is closed either to retire this owner or after its escape transition
+	// has been recorded. Those states are mutually exclusive for one owner.
+	stop chan struct{}
 }
 
 func newWorkerWithID(pool *PoolWithID, entry *workerIDEntry) *goWorkerWithID {
 	return &goWorkerWithID{
-		pool:            pool,
-		entry:           entry,
-		stop:            make(chan struct{}),
-		escapeAnnounced: make(chan struct{}),
+		pool:  pool,
+		entry: entry,
+		stop:  make(chan struct{}),
 	}
 }
 
@@ -71,7 +68,7 @@ func (w *goWorkerWithID) loop() {
 		case task := <-w.entry.tasks:
 			if !w.pool.startTask(w) {
 				managedOwner = false
-				<-w.escapeAnnounced
+				<-w.stop
 				w.pool.escapedWorkerExited(w)
 				return
 			}
@@ -79,7 +76,7 @@ func (w *goWorkerWithID) loop() {
 			w.execute(task)
 			if w.pool.finishTask(w) {
 				managedOwner = false
-				<-w.escapeAnnounced
+				<-w.stop
 				w.pool.escapedWorkerExited(w)
 				return
 			}

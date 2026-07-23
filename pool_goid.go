@@ -312,18 +312,27 @@ func (p *PoolWithID) finishTask(owner *goWorkerWithID) bool {
 	}
 	registry.removeExpiry(entry)
 	entry.taskStartedAt = 0
-	entry.lastIdleAt = time.Now().UnixNano()
 	if entry.drained() {
+		entry.lastIdleAt = time.Now().UnixNano()
 		registry.appendIdle(entry)
 	}
 	return false
 }
 
 func (p *PoolWithID) retireOwnerIfDrained(owner *goWorkerWithID) bool {
+	state := atomic.LoadInt32(&p.state)
+	capacity := p.Cap()
+	// Release transitions state and scans entries while holding p.lock, so the
+	// normal opened path does not need to contend with Submit on that lock.
+	if state == OPENED && (capacity <= 0 || p.Running() <= capacity) {
+		return false
+	}
+
 	entry := owner.entry
 	p.lock.Lock()
-	state := atomic.LoadInt32(&p.state)
-	overCapacity := p.Cap() > 0 && p.Running() > p.Cap()
+	state = atomic.LoadInt32(&p.state)
+	capacity = p.Cap()
+	overCapacity := capacity > 0 && p.Running() > capacity
 	if state == OPENED && !overCapacity {
 		p.maybeManagedDoneLocked()
 		p.lock.Unlock()
@@ -391,7 +400,7 @@ func (p *PoolWithID) ownerExited(owner *goWorkerWithID) {
 		entry.mu.Unlock()
 		registry.expiryMu.Unlock()
 		p.lock.Unlock()
-		<-owner.escapeAnnounced
+		<-owner.stop
 		p.escapedWorkerExited(owner)
 		return
 	}
@@ -759,7 +768,7 @@ func (p *PoolWithID) purgeExpired(now int64) {
 		p.publishEscapeEvent(item.event)
 	}
 	for _, item := range transitions {
-		close(item.worker.escapeAnnounced)
+		close(item.worker.stop)
 	}
 	p.escape.transitionMu.Unlock()
 	for _, item := range transitions {
