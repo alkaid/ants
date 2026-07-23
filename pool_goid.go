@@ -39,9 +39,21 @@ const MinTaskBuffer = 10
 // leaves it nil.
 var poolWithIDBackgroundStartHook func()
 
-// PoolWithID executes tasks for the same ID in FIFO start order. A task that
-// runs for ExpiryDuration may be escaped so a replacement owner can continue
-// consuming that ID's queue.
+// PoolWithID executes tasks for the same ID serially and in FIFO start order
+// when each Submit has returned before the next begins. Concurrent Submit calls
+// have no defined order, and the timeout recovery path does not guarantee task
+// completion order.
+//
+// ExpiryDuration is measured from the start of task execution. When a task
+// reaches that threshold, the current owner may escape and a replacement owner
+// continues consuming the same ID queue. The escaped task cannot be forcibly
+// stopped and may overlap later tasks, retain resources, or produce late side
+// effects. WithDisablePurgeRunning(true) or WithDisablePurge(true) disables this
+// recovery and allows a blocked task to block its ID indefinitely.
+//
+// Running and Free count only managed current owners. Escaped workers do not
+// consume pool capacity; Running()+EscapeSnapshot().Total estimates the live
+// worker goroutines associated with the pool.
 type PoolWithID struct {
 	*poolCommon
 
@@ -75,12 +87,21 @@ type poolWithIDTestHooks struct {
 	afterReleaseLock               func()
 }
 
-// Submit registers task for id. In nonblocking mode, an existing ID is
-// rejected when its queue is already at TaskBuffer or when the final channel
-// send cannot complete immediately. In blocking mode, an existing ID may use
-// the full physical queue and waits for space or pool closure. MaxBlockingTasks
-// does not limit that existing-ID wait, and a task that recursively submits to
-// its own full queue in blocking mode is not guaranteed to make progress.
+// Submit registers task for id. Successfully returned, non-concurrent submits
+// for one ID start in FIFO order unless timeout recovery makes a replacement
+// owner overlap an escaped task. Concurrent Submit calls have no defined order.
+//
+// In nonblocking mode, a new ID is rejected when owner capacity is unavailable.
+// An existing ID is rejected when its observed queue length reaches TaskBuffer
+// or when the final channel send cannot complete immediately. The admission
+// check and send are not serialized, so concurrent submissions may enter the
+// reserved half of the physical queue.
+//
+// In blocking mode, a new ID waits for owner capacity subject to
+// MaxBlockingTasks. An existing ID may use the full physical queue and then
+// waits for queue space or pool closure; MaxBlockingTasks does not limit that
+// queue wait. A task that recursively submits to its own full queue in blocking
+// mode is not guaranteed to make progress.
 func (p *PoolWithID) Submit(id int, task func()) error {
 	generation := p.generation.Load()
 	entry, stop, err := p.registerSubmit(id, generation)
@@ -120,9 +141,15 @@ func (p *PoolWithID) Submit(id int, task func()) error {
 	}
 }
 
-// NewPoolWithID instantiates a PoolWithID with customized options.
+// NewPoolWithID instantiates a PoolWithID with the same public Option type used
+// by the other pool constructors. It accepts direct Option values, expanded
+// []Option slices, and WithOptions. WithPreAlloc(true) is accepted but does not
+// preallocate or reuse ID workers.
+//
 // TaskBuffer is normalized to a default admission limit of 10 when it is zero;
-// the physical per-ID queue has twice the configured admission capacity.
+// the physical per-ID queue has twice the configured admission capacity. A
+// negative value or one that overflows when doubled returns
+// ErrInvalidPoolWithIDTaskBuffer before background goroutines are started.
 func NewPoolWithID(size int, options ...Option) (*PoolWithID, error) {
 	pc, err := newPoolCommon(size, false, options...)
 	if err != nil {
@@ -349,14 +376,18 @@ func (p *PoolWithID) IsClosed() bool {
 }
 
 // Release stops accepting submissions and starts draining accepted work. It
-// returns after the close transition and wakeups have been issued.
+// returns after the close transition and wakeups have been issued, without
+// waiting for the managed drain. Use ReleaseTimeout or ReleaseContext to wait.
+// Escaped workers are not part of the managed drain and may remain alive.
 func (p *PoolWithID) Release() {
 	_, _ = p.startRelease()
 }
 
 // ReleaseTimeout starts or joins the current release and waits for managed
-// owners and accepted queues to drain until timeout. Escaped workers are not
-// included in this wait.
+// owners and accepted queues to drain until timeout. Tasks accepted before the
+// release continue through normal completion, panic, or timeout escape.
+// Escaped workers are not included in this wait; CLOSED therefore does not
+// imply that every task goroutine has exited.
 func (p *PoolWithID) ReleaseTimeout(timeout time.Duration) error {
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
@@ -367,8 +398,9 @@ func (p *PoolWithID) ReleaseTimeout(timeout time.Duration) error {
 	return err
 }
 
-// ReleaseContext starts or joins the current release and waits until the pool
-// is fully closed. A nil context initiates release without waiting.
+// ReleaseContext starts or joins the current release and waits until managed
+// owners and accepted queues have drained. Escaped workers are not included in
+// this wait. A nil context initiates release without waiting.
 func (p *PoolWithID) ReleaseContext(ctx context.Context) error {
 	done, closed := p.startRelease()
 	if closed {
@@ -454,7 +486,10 @@ func (p *PoolWithID) awaitClosed(managedDone, purgeFinished, tickFinished, close
 }
 
 // Reboot waits for an in-progress managed drain, then opens a new empty ID
-// registry. Escape events and snapshots remain continuous across the reboot.
+// registry. It does not wait for escaped workers. Such workers cannot modify
+// the new scheduler state, but their tasks may overlap new work for the same ID
+// and may still produce late side effects. Escape events, snapshot counts, and
+// dropped-event totals remain continuous across the reboot.
 func (p *PoolWithID) Reboot() {
 	for {
 		p.lock.Lock()

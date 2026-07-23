@@ -122,6 +122,126 @@ pool.ReleaseTimeout(time.Second * 3)
 pool.Reboot()
 ```
 
+### `PoolWithID` contract
+
+`NewPoolWithID(size, ...Option)` uses the same public `Option` type as the
+other constructors. Direct options, expanded `[]Option` slices, and
+`WithOptions` remain supported. This fork adds `TaskBuffer` and
+`DisablePurgeRunning` to `Options`, so it does not promise compatibility with
+unkeyed `Options` literals written for the upstream field count. Use option
+functions or keyed literals. `WithPreAlloc(true)` is accepted by `PoolWithID`
+but intentionally has no effect: ID workers are neither preallocated nor
+reused.
+
+For each ID, successful non-concurrent submissions start in FIFO order and run
+serially during normal operation. Concurrent calls to `Submit` have no defined
+order. `ExpiryDuration` is measured from the start of task execution, not from
+`Submit`. When a running task reaches it, the old owner escapes and a replacement
+owner can run later tasks for the same ID. This restores scheduling but allows
+the old and new tasks to overlap; Go cannot forcibly stop the old task, which
+may retain resources or produce late side effects. Timeout recovery does not
+guarantee completion order.
+
+`TaskBuffer` is the per-ID admission limit, not the channel capacity. A positive
+value `N` creates a physical channel of `2*N`; zero selects the default limit 10
+and capacity 20. Negative values and values that overflow when doubled make the
+constructor return `ErrInvalidPoolWithIDTaskBuffer`.
+
+| Submission path | Behavior |
+|---|---|
+| New ID, no owner capacity, `Nonblocking=true` | Returns `ErrPoolOverload` immediately. |
+| Existing ID, `Nonblocking=true` | Rejects when the observed queue length reaches `TaskBuffer`; a final nonblocking send also rejects if the physical channel is full. |
+| New ID, `Nonblocking=false` | Waits for owner capacity and is subject to `MaxBlockingTasks`. |
+| Existing ID, `Nonblocking=false` | May use the full `2*TaskBuffer` channel, then waits for queue space or pool closure. `MaxBlockingTasks` does not limit this wait. |
+
+The nonblocking admission check and send are not serialized. Concurrent callers
+may therefore enter the reserved half between `TaskBuffer` and `2*TaskBuffer`;
+the bounded channel and final nonblocking send are what guarantee that `Submit`
+does not wait. A task that uses blocking mode to recursively submit to its own
+full ID queue is not guaranteed to make progress.
+
+`WithDisablePurgeRunning(true)` prevents a long-running owner from escaping.
+`WithDisablePurge(true)` stops the purge loop and therefore disables this
+recovery as well. Either option lets a permanently blocked task block its ID
+indefinitely.
+
+`Release` stops admission and starts draining accepted tasks; use
+`ReleaseTimeout` or `ReleaseContext` to wait for the managed drain. Escaped
+workers are not included in that wait, so `CLOSED` does not mean every task
+goroutine has exited. `Reboot` waits for the managed drain, opens an empty ID
+registry, and also does not wait for escaped workers. An old escaped task cannot
+change the new scheduler state, but it may overlap same-ID work after reboot and
+still produce late side effects.
+
+`EscapeEvents` is a best-effort notification channel with a fixed capacity of
+64. Publishing never blocks; full-channel notifications are counted in
+`EscapeSnapshot().DroppedEvents`. The channel has one direct application
+consumer, remains open across `Release` and `Reboot`, and must be stopped with an
+application-owned context. `EscapeSnapshot` is the authoritative current state.
+`Running()+EscapeSnapshot().Total` estimates the pool's live worker goroutines.
+Do not automatically retry a task because it escaped: the old task can still
+complete and duplicate side effects.
+
+The following external-package example is compiled as part of the test suite.
+It keeps per-ID state out of metric labels and exports only a low-cardinality
+total gauge:
+
+```go
+package monitoring
+
+import (
+	"context"
+	"log"
+	"time"
+
+	ants "github.com/alkaid/ants/v2"
+)
+
+func MonitorPoolWithID(
+	ctx context.Context,
+	pool *ants.PoolWithID,
+	recordByID func(id, escaped int),
+	setEscapedGauge func(total int),
+) {
+	knownIDs := make(map[int]struct{})
+	ticker := time.NewTicker(10 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case event := <-pool.EscapeEvents():
+			recordByID(event.ID, event.ByID)
+			if event.ByID == 0 {
+				delete(knownIDs, event.ID)
+			} else {
+				knownIDs[event.ID] = struct{}{}
+			}
+			log.Printf("pool escape type=%d id=%d by_id=%d total=%d",
+				event.Type, event.ID, event.ByID, event.Total)
+		case <-ticker.C:
+			// Events notify promptly; the snapshot repairs missed notifications.
+			snapshot := pool.EscapeSnapshot()
+			for id := range knownIDs {
+				if snapshot.ByID[id] == 0 {
+					recordByID(id, 0)
+					delete(knownIDs, id)
+				}
+			}
+			for id, count := range snapshot.ByID {
+				recordByID(id, count)
+				knownIDs[id] = struct{}{}
+			}
+			setEscapedGauge(snapshot.Total)
+			if snapshot.DroppedEvents != 0 {
+				log.Printf("pool escape notifications dropped=%d", snapshot.DroppedEvents)
+			}
+		case <-ctx.Done():
+			return
+		}
+	}
+}
+```
+
 ## ⚙️ About sequence
 
 All tasks submitted to `ants` pool will not be guaranteed to be addressed in order, because those tasks scatter among a series of concurrent workers, thus those tasks would be executed concurrently.

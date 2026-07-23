@@ -20,7 +20,9 @@ const (
 	PoolWithIDEscapedWorkerExited
 )
 
-// PoolWithIDEscapeEvent describes one worker escape state transition.
+// PoolWithIDEscapeEvent describes one best-effort worker escape notification.
+// Applications should reconcile notifications against EscapeSnapshot rather
+// than treating the event stream as authoritative state.
 type PoolWithIDEscapeEvent struct {
 	// Type identifies whether a worker escaped or later exited.
 	Type PoolWithIDEscapeEventType
@@ -64,14 +66,22 @@ func newPoolWithIDEscapeState() *poolWithIDEscapeState {
 
 // EscapeEvents returns the nonblocking notification stream for escaped owner
 // starts and exits. The channel remains open across Release and Reboot and has
-// a fixed capacity of 64; applications should use EscapeSnapshot to reconcile
-// dropped notifications.
+// a fixed capacity of 64. Publishing never waits; a full channel drops the
+// notification and increments EscapeSnapshot().DroppedEvents.
+//
+// One application consumer should read the channel and distribute events when
+// multiple observers need them. Applications should use their own context to
+// stop consuming and periodically use EscapeSnapshot as the authoritative
+// current state. An escape event must not by itself trigger an automatic retry:
+// the old task may still run and produce late side effects.
 func (p *PoolWithID) EscapeEvents() <-chan PoolWithIDEscapeEvent {
 	return p.escape.events
 }
 
-// EscapeSnapshot returns a consistent copy of the current escaped-worker
-// counts and the cumulative number of dropped notifications.
+// EscapeSnapshot returns the authoritative current escaped-worker counts and
+// the cumulative number of dropped notifications. ByID is a caller-owned copy,
+// and DroppedEvents is monotonic for the lifetime of the PoolWithID, including
+// across Release and Reboot.
 func (p *PoolWithID) EscapeSnapshot() PoolWithIDEscapeSnapshot {
 	if hook := p.testHooks.beforeEscapeSnapshotLock; hook != nil {
 		hook()

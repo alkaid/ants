@@ -35,12 +35,21 @@ func loadOptions(options ...Option) *Options {
 	return opts
 }
 
-// Options contains all options which will be applied when instantiating an ants pool.
+// Options contains all options which will be applied when instantiating an ants
+// pool.
+//
+// This fork adds PoolWithID-specific fields to the upstream layout. Prefer
+// keyed literals or Option functions: unkeyed Options literals are compatible
+// only when they contain every field in this version's exact order.
 type Options struct {
 	// ExpiryDuration is a period for the scavenger goroutine to clean up those expired workers,
 	// the scavenger scans all workers every `ExpiryDuration` and clean up those workers that haven't been
-	// used for more than `ExpiryDuration`. For PoolWithID it is also the running-task escape threshold:
-	// a replacement owner takes over the same ID queue after this duration unless running purge is disabled.
+	// used for more than `ExpiryDuration`. For PoolWithID it is also measured
+	// from the start of each task's execution. Once a running task reaches this
+	// escape threshold, a replacement owner takes over the same ID queue unless
+	// running purge is disabled. This is not an end-to-end deadline measured
+	// from Submit, and it cannot stop the escaped task or prevent late side
+	// effects.
 	ExpiryDuration time.Duration
 
 	// PreAlloc indicates whether to make memory pre-allocation when initializing Pool.
@@ -77,13 +86,18 @@ type Options struct {
 	DisablePurge bool
 
 	// TaskBuffer is the PoolWithID admission limit for each ID. The physical
-	// task channel has twice this capacity. Zero uses an admission limit of 10;
-	// negative values and values that overflow when doubled are rejected.
-	// Nonblocking submissions reject at this limit, while blocking submissions
-	// may use the full physical capacity and then wait for space or pool closure.
-	// MaxBlockingTasks does not limit this existing-ID wait, and a blocking task
-	// that recursively submits to its own full queue is not guaranteed to make
-	// progress.
+	// task channel has twice this capacity. Zero uses an admission limit of 10
+	// and a physical capacity of 20; negative values and values that overflow
+	// when doubled are rejected by NewPoolWithID.
+	//
+	// Nonblocking submissions reject when the observed queue length reaches this
+	// limit. The check and send are not serialized, so concurrent submissions
+	// may use the reserved half between TaskBuffer and 2*TaskBuffer; a final
+	// nonblocking send still rejects if the physical channel is full. Blocking
+	// submissions may use the full physical capacity and then wait for space or
+	// pool closure. MaxBlockingTasks does not limit this existing-ID wait, and a
+	// blocking task that recursively submits to its own full queue is not
+	// guaranteed to make progress.
 	TaskBuffer int
 
 	// DisablePurgeRunning prevents PoolWithID from escaping an owner whose task
@@ -92,14 +106,17 @@ type Options struct {
 	DisablePurgeRunning bool
 }
 
-// WithOptions accepts the whole Options config.
+// WithOptions accepts the whole Options config. Prefer a keyed Options literal
+// because this fork's PoolWithID fields extend the upstream struct layout.
 func WithOptions(options Options) Option {
 	return func(opts *Options) {
 		*opts = options
 	}
 }
 
-// WithExpiryDuration sets up the interval time of cleaning up goroutines.
+// WithExpiryDuration sets up the interval time of cleaning up goroutines. For
+// PoolWithID it also sets the running-task escape threshold, measured from the
+// start of task execution rather than from Submit.
 func WithExpiryDuration(expiryDuration time.Duration) Option {
 	return func(opts *Options) {
 		opts.ExpiryDuration = expiryDuration
@@ -164,9 +181,14 @@ func WithDisablePurgeRunning(disable bool) Option {
 }
 
 // WithTaskBuffer sets the PoolWithID admission limit for each ID. Its physical
-// task channel capacity is twice taskBuffer. In nonblocking mode, submissions
-// reject once the observed queue length reaches the admission limit and always
-// use a final nonblocking send. In blocking mode, submissions may use the full
+// task channel capacity is twice taskBuffer; zero selects the default limit 10
+// and capacity 20. Negative values and values that overflow when doubled make
+// NewPoolWithID return ErrInvalidPoolWithIDTaskBuffer.
+//
+// In nonblocking mode, submissions reject once the observed queue length
+// reaches the admission limit and always use a final nonblocking send. Because
+// the check and send are not serialized, concurrent submissions may use the
+// reserved half of the channel. In blocking mode, submissions may use the full
 // channel and wait for space or closure; MaxBlockingTasks does not limit this
 // existing-ID wait. A task that recursively submits to its own full queue in
 // blocking mode is not guaranteed to make progress.

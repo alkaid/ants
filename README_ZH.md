@@ -123,6 +123,113 @@ pool.ReleaseTimeout(time.Second * 3)
 pool.Reboot()
 ```
 
+### `PoolWithID` 契约
+
+`NewPoolWithID(size, ...Option)` 与其他构造函数使用同一个公开 `Option`
+类型，继续支持直接传入 option、展开 `[]Option` 和 `WithOptions`。本 fork 在
+`Options` 中增加了 `TaskBuffer` 和 `DisablePurgeRunning`，因此不承诺兼容按
+上游字段数量书写的非键名 `Options` 字面量；应优先使用 option 函数或键名
+字面量。`PoolWithID` 接受 `WithPreAlloc(true)`，但该选项有意不生效：ID
+worker 不会预分配或复用。
+
+对于同一 ID，非并发且已成功返回的提交在正常路径按 FIFO 顺序开始，并保持
+串行执行；真正并发的多个 `Submit` 调用之间不定义顺序。`ExpiryDuration` 从
+任务实际开始执行时计时，而不是从 `Submit` 开始。运行任务达到该阈值后，旧
+owner 会逃逸，新 owner 可以执行该 ID 的后续任务。该机制恢复的是调度能力，
+旧任务和新任务可能重叠；Go 无法强制终止旧任务，它仍可能占用资源或产生迟到
+副作用。超时恢复路径不保证任务完成顺序。
+
+`TaskBuffer` 是每个 ID 的接纳水位，不是 channel 容量。正值 `N` 对应物理
+channel 容量 `2*N`；零使用默认接纳水位 10 和容量 20。负数或乘 2 后溢出的
+值会让构造函数返回 `ErrInvalidPoolWithIDTaskBuffer`。
+
+| 提交路径 | 行为 |
+|---|---|
+| 新 ID 无 owner 容量，`Nonblocking=true` | 立即返回 `ErrPoolOverload`。 |
+| 已有 ID，`Nonblocking=true` | 观察到队列长度达到 `TaskBuffer` 时拒绝；物理 channel 已满时，最终非阻塞发送也会拒绝。 |
+| 新 ID，`Nonblocking=false` | 等待 owner 容量，并受 `MaxBlockingTasks` 限制。 |
+| 已有 ID，`Nonblocking=false` | 可以使用完整的 `2*TaskBuffer` channel，随后等待队列空间或池关闭；`MaxBlockingTasks` 不限制此等待。 |
+
+非阻塞模式的水位检查和发送没有串行化，因此并发调用可能进入 `TaskBuffer` 到
+`2*TaskBuffer` 之间的预留区；有界 channel 和最终非阻塞发送才保证 `Submit`
+不会等待。任务在阻塞模式下向自己已满的同 ID 队列递归提交时，不保证活性。
+
+`WithDisablePurgeRunning(true)` 会阻止长时间运行的 owner 逃逸；
+`WithDisablePurge(true)` 会停止清理循环，因此也会关闭该恢复机制。使用任一选项
+时，永久阻塞的任务都可能永久阻塞对应 ID。
+
+`Release` 停止接纳并开始排空已接受任务；需要等待受管任务排空时，应使用
+`ReleaseTimeout` 或 `ReleaseContext`。escaped worker 不属于该等待范围，因而
+`CLOSED` 不代表所有任务 goroutine 都已退出。`Reboot` 等待受管任务排空后打开
+一个空 ID 注册表，同样不等待 escaped worker。旧 escaped 任务不能修改新的
+调度状态，但可能与重启后的同 ID 任务重叠，并继续产生迟到副作用。
+
+`EscapeEvents` 是容量固定为 64 的尽力通知通道。发布从不阻塞；通道满时，
+丢弃数记录在 `EscapeSnapshot().DroppedEvents`。应用只应有一个直接消费者，
+通道跨 `Release` 和 `Reboot` 保持打开，消费协程应使用应用自己的 context
+退出。`EscapeSnapshot` 才是当前状态的权威来源。
+`Running()+EscapeSnapshot().Total` 可估算该池仍存活的 worker goroutine 数。
+不能因为任务逃逸就自动重试：旧任务仍可能完成并造成重复副作用。
+
+下面的外部包示例会作为测试的一部分参与编译。示例不把 ID 用作指标标签，只
+导出低基数的全池 escaped 总量：
+
+```go
+package monitoring
+
+import (
+	"context"
+	"log"
+	"time"
+
+	ants "github.com/alkaid/ants/v2"
+)
+
+func MonitorPoolWithID(
+	ctx context.Context,
+	pool *ants.PoolWithID,
+	recordByID func(id, escaped int),
+	setEscapedGauge func(total int),
+) {
+	knownIDs := make(map[int]struct{})
+	ticker := time.NewTicker(10 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case event := <-pool.EscapeEvents():
+			recordByID(event.ID, event.ByID)
+			if event.ByID == 0 {
+				delete(knownIDs, event.ID)
+			} else {
+				knownIDs[event.ID] = struct{}{}
+			}
+			log.Printf("pool escape type=%d id=%d by_id=%d total=%d",
+				event.Type, event.ID, event.ByID, event.Total)
+		case <-ticker.C:
+			// 事件用于及时通知；快照用于修正丢失的通知。
+			snapshot := pool.EscapeSnapshot()
+			for id := range knownIDs {
+				if snapshot.ByID[id] == 0 {
+					recordByID(id, 0)
+					delete(knownIDs, id)
+				}
+			}
+			for id, count := range snapshot.ByID {
+				recordByID(id, count)
+				knownIDs[id] = struct{}{}
+			}
+			setEscapedGauge(snapshot.Total)
+			if snapshot.DroppedEvents != 0 {
+				log.Printf("pool escape notifications dropped=%d", snapshot.DroppedEvents)
+			}
+		case <-ctx.Done():
+			return
+		}
+	}
+}
+```
+
 ## ⚙️ 关于任务执行顺序
 
 `ants` 并不保证提交的任务被执行的顺序，执行的顺序也不是和提交的顺序保持一致，因为在 `ants` 是并发地处理所有提交的任务，提交的任务会被分派到正在并发运行的 workers 上去，因此那些任务将会被并发且无序地被执行。
