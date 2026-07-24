@@ -210,6 +210,12 @@ type poolCommon struct {
 	now int64
 
 	options *Options
+
+	testHooks poolCommonTestHooks
+}
+
+type poolCommonTestHooks struct {
+	afterCapacityWaitRegistered func()
 }
 
 func newPool(size int, options ...Option) (*poolCommon, error) {
@@ -382,16 +388,15 @@ func (p *poolCommon) Cap() int {
 
 // Tune changes the capacity of this pool, note that it is noneffective to the infinite or pre-allocation pool.
 func (p *poolCommon) Tune(size int) {
+	p.lock.Lock()
+	defer p.lock.Unlock()
+
 	capacity := p.Cap()
 	if capacity == -1 || size <= 0 || size == capacity || p.options.PreAlloc {
 		return
 	}
 	atomic.StoreInt32(&p.capacity, int32(size))
 	if size > capacity {
-		if size-capacity == 1 {
-			p.cond.Signal()
-			return
-		}
 		p.cond.Broadcast()
 	}
 }
@@ -557,6 +562,9 @@ retry:
 
 	// Otherwise, we'll have to keep them blocked and wait for at least one worker to be put back into pool.
 	p.addWaiting(1)
+	if hook := p.testHooks.afterCapacityWaitRegistered; hook != nil {
+		hook()
+	}
 	p.cond.Wait() // block and wait for an available worker
 	p.addWaiting(-1)
 

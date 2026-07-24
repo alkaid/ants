@@ -79,8 +79,10 @@ type PoolWithID struct {
 type poolWithIDTestHooks struct {
 	afterAdmissionCheck            func()
 	afterSubmitRegistered          func()
+	beforeSubmitFinished           func()
 	afterCapacityWaitRegistered    func()
 	afterTaskFinished              func()
+	beforeOwnerExited              func(*goWorkerWithID)
 	afterPurgeEntryVisited         func()
 	afterEscapeTransitionsRecorded func()
 	beforeEscapeSnapshotLock       func()
@@ -112,6 +114,9 @@ func (p *PoolWithID) Submit(id int, task func()) error {
 
 	accepted := false
 	defer func() {
+		if hook := p.testHooks.beforeSubmitFinished; hook != nil {
+			hook()
+		}
 		p.finishSubmit(entry, accepted)
 	}()
 
@@ -275,7 +280,9 @@ func (p *PoolWithID) finishSubmit(entry *workerIDEntry, accepted bool) {
 		registry.expiryMu.Unlock()
 	}
 
-	if atomic.LoadInt32(&p.state) != OPENED {
+	state := atomic.LoadInt32(&p.state)
+	capacity := p.Cap()
+	if state != OPENED || (capacity > 0 && p.Running() > capacity) {
 		p.retireEntryIfDrained(entry, owner)
 	}
 }
@@ -332,7 +339,7 @@ func (p *PoolWithID) retireOwnerIfDrained(owner *goWorkerWithID) bool {
 	p.lock.Lock()
 	state = atomic.LoadInt32(&p.state)
 	capacity = p.Cap()
-	overCapacity := capacity > 0 && p.Running() > capacity
+	overCapacity := capacity > 0 && len(p.registry.items) > capacity
 	if state == OPENED && !overCapacity {
 		p.maybeManagedDoneLocked()
 		p.lock.Unlock()
@@ -354,6 +361,14 @@ func (p *PoolWithID) retireOwnerIfDrained(owner *goWorkerWithID) bool {
 
 func (p *PoolWithID) retireEntryIfDrained(entry *workerIDEntry, owner *goWorkerWithID) bool {
 	p.lock.Lock()
+	state := atomic.LoadInt32(&p.state)
+	capacity := p.Cap()
+	overCapacity := capacity > 0 && len(p.registry.items) > capacity
+	if state == OPENED && !overCapacity {
+		p.maybeManagedDoneLocked()
+		p.lock.Unlock()
+		return false
+	}
 	registry := entry.registry
 	registry.expiryMu.Lock()
 	entry.mu.Lock()
@@ -391,6 +406,9 @@ func (p *PoolWithID) retireEntryLocked(entry *workerIDEntry, owner *goWorkerWith
 }
 
 func (p *PoolWithID) ownerExited(owner *goWorkerWithID) {
+	if hook := p.testHooks.beforeOwnerExited; hook != nil {
+		hook(owner)
+	}
 	p.lock.Lock()
 	entry := owner.entry
 	registry := entry.registry
@@ -409,7 +427,7 @@ func (p *PoolWithID) ownerExited(owner *goWorkerWithID) {
 		entry.taskStartedAt = 0
 		entry.lastIdleAt = time.Now().UnixNano()
 		state := atomic.LoadInt32(&p.state)
-		overCapacity := p.Cap() > 0 && p.Running() > p.Cap()
+		overCapacity := p.Cap() > 0 && len(p.registry.items) > p.Cap()
 		if !entry.drained() || (state == OPENED && !overCapacity) {
 			replacement := newWorkerWithID(p, entry)
 			entry.owner = replacement
@@ -593,13 +611,44 @@ func (p *PoolWithID) Reboot() {
 // Tune changes the owner capacity for PoolWithID. PreAlloc is intentionally a
 // no-op for this pool and therefore does not disable tuning.
 func (p *PoolWithID) Tune(size int) {
+	p.lock.Lock()
 	capacity := p.Cap()
 	if capacity == -1 || size <= 0 || size == capacity {
+		p.lock.Unlock()
 		return
 	}
 	atomic.StoreInt32(&p.capacity, int32(size))
 	if size > capacity {
 		p.cond.Broadcast()
+		p.lock.Unlock()
+		return
+	}
+
+	if atomic.LoadInt32(&p.state) != OPENED {
+		p.lock.Unlock()
+		return
+	}
+
+	registry := p.registry
+	excess := len(registry.items) - size
+	var ownersToStop []*goWorkerWithID
+	registry.expiryMu.Lock()
+	for entry := registry.idle.head; entry != nil && excess > 0; {
+		next := entry.expiryNext
+		entry.mu.Lock()
+		owner := entry.owner
+		if p.detachEntryLocked(entry, owner) {
+			ownersToStop = append(ownersToStop, owner)
+			excess--
+		}
+		entry.mu.Unlock()
+		entry = next
+	}
+	registry.expiryMu.Unlock()
+	p.lock.Unlock()
+
+	for _, owner := range ownersToStop {
+		close(owner.stop)
 	}
 }
 
@@ -732,7 +781,8 @@ func (p *PoolWithID) purgeExpired(now int64) {
 			entry.taskStartedAt = 0
 			entry.lastIdleAt = now
 			if entry.drained() {
-				if state == CLOSING {
+				overCapacity := p.Cap() > 0 && len(p.registry.items) > p.Cap()
+				if state == CLOSING || overCapacity {
 					if p.detachEntryLocked(entry, newOwner) {
 						ownersToStop = append(ownersToStop, newOwner)
 					}
