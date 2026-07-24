@@ -67,6 +67,9 @@ type PoolWithID struct {
 	*poolCommon
 
 	registry       *workerIDRegistry
+	reservations   map[int]*workerIDReservation
+	reservedOwners atomic.Int32
+	nextAllocator  uint64
 	admissionLimit int
 	generation     atomic.Uint64
 
@@ -86,17 +89,46 @@ type PoolWithID struct {
 }
 
 type poolWithIDTestHooks struct {
-	afterAdmissionCheck            func()
-	afterSubmitRegistered          func()
-	beforeSubmitFinished           func()
-	afterCapacityWaitRegistered    func()
-	afterTaskFinished              func()
-	beforeOwnerExited              func(*goWorkerWithID)
-	afterPurgeEntryVisited         func()
-	afterEscapeTransitionsRecorded func()
-	beforeEscapeSnapshotLock       func()
-	beforeReleaseLock              func()
-	afterReleaseLock               func()
+	afterAdmissionCheck              func()
+	afterSubmitRegistered            func()
+	beforeSubmitFinished             func()
+	afterCapacityWaitRegistered      func()
+	afterTaskFinished                func()
+	beforeOwnerExited                func(*goWorkerWithID)
+	beforeReservationAllocate        func(int)
+	afterReservationAllocated        func(int)
+	duringReservationCapacityConvert func(int)
+	afterPurgeEntryVisited           func()
+	afterEscapeTransitionsRecorded   func()
+	beforeEscapeSnapshotLock         func()
+	beforeReleaseLock                func()
+	afterReleaseLock                 func()
+}
+
+type workerIDReservationState uint8
+
+const (
+	workerIDReservationPending workerIDReservationState = iota
+	workerIDReservationCommitted
+	workerIDReservationAborted
+)
+
+// workerIDReservation owns one capacity slot while its allocator creates the
+// entry outside p.lock. Its fields and map membership are protected by p.lock;
+// only the recorded allocator may commit or abort and close done.
+type workerIDReservation struct {
+	id         int
+	registry   *workerIDRegistry
+	generation uint64
+	allocator  uint64
+	state      workerIDReservationState
+	done       chan struct{}
+}
+
+// poolWithIDWaiter transfers one Waiting slot across adjacent capacity and
+// reservation waits without double-counting the Submit call.
+type poolWithIDWaiter struct {
+	held bool
 }
 
 // Submit registers task for id. Successfully returned, non-concurrent submits
@@ -116,7 +148,8 @@ type poolWithIDTestHooks struct {
 // mode is not guaranteed to make progress.
 func (p *PoolWithID) Submit(id int, task func()) error {
 	generation := p.generation.Load()
-	entry, stop, err := p.registerSubmit(id, generation)
+	waiter := poolWithIDWaiter{}
+	entry, stop, err := p.registerSubmit(id, generation, &waiter)
 	if err != nil {
 		return err
 	}
@@ -183,6 +216,7 @@ func NewPoolWithID(size int, options ...Option) (*PoolWithID, error) {
 	p := &PoolWithID{
 		poolCommon:     pc,
 		registry:       newWorkerIDRegistry(),
+		reservations:   make(map[int]*workerIDReservation),
 		admissionLimit: limit,
 		submitStop:     make(chan struct{}),
 		managedDone:    make(chan struct{}),
@@ -197,17 +231,22 @@ func NewPoolWithID(size int, options ...Option) (*PoolWithID, error) {
 	return p, nil
 }
 
-func (p *PoolWithID) registerSubmit(id int, generation uint64) (*workerIDEntry, <-chan struct{}, error) {
+func (p *PoolWithID) registerSubmit(
+	id int,
+	generation uint64,
+	waiter *poolWithIDWaiter,
+) (*workerIDEntry, <-chan struct{}, error) {
 	p.lock.Lock()
 	for {
 		if atomic.LoadInt32(&p.state) != OPENED ||
 			p.generation.Load() != generation {
-			p.maybeManagedDoneLocked()
+			p.releaseWaiterLocked(waiter)
 			p.lock.Unlock()
 			return nil, nil, ErrPoolClosed
 		}
 
 		if entry := p.registry.items[id]; entry != nil {
+			p.releaseWaiterLocked(waiter)
 			entry.mu.Lock()
 			entry.pendingSubmits++
 			entry.outstanding++
@@ -220,44 +259,177 @@ func (p *PoolWithID) registerSubmit(id int, generation uint64) (*workerIDEntry, 
 			return entry, stop, nil
 		}
 
-		if capacity := p.Cap(); capacity == -1 || p.Running() < capacity {
-			now := time.Now().UnixNano()
-			registry := p.registry
-			entry := newWorkerIDEntry(registry, id, p.admissionLimit*2, now)
-			owner := newWorkerWithID(p, entry)
-			entry.owner = owner
-			entry.pendingSubmits = 1
-			entry.outstanding = 1
-			registry.items[id] = entry
-			p.addRunning(1)
-			owner.run()
+		if reservation := p.reservations[id]; reservation != nil {
+			if p.options.Nonblocking || !p.acquireWaiterLocked(waiter) {
+				p.releaseWaiterLocked(waiter)
+				p.lock.Unlock()
+				return nil, nil, ErrPoolOverload
+			}
+			done := reservation.done
 			stop := p.submitStop
 			p.lock.Unlock()
-			if hook := p.testHooks.afterSubmitRegistered; hook != nil {
-				hook()
+			select {
+			case <-done:
+			case <-stop:
 			}
-			return entry, stop, nil
+			p.lock.Lock()
+			continue
 		}
 
-		if p.options.Nonblocking ||
-			(p.options.MaxBlockingTasks != 0 && p.Waiting() >= p.options.MaxBlockingTasks) {
+		capacity := p.Cap()
+		reserved := int(p.reservedOwners.Load())
+		if capacity == -1 || p.Running()+reserved < capacity {
+			p.releaseWaiterLocked(waiter)
+			reservation := p.reserveOwnerLocked(id, generation)
+			allocator := reservation.allocator
+			p.lock.Unlock()
+			return p.allocateReservedOwner(reservation, allocator)
+		}
+
+		if p.options.Nonblocking || !p.acquireWaiterLocked(waiter) {
+			p.releaseWaiterLocked(waiter)
 			p.lock.Unlock()
 			return nil, nil, ErrPoolOverload
 		}
 
-		p.addWaiting(1)
 		if hook := p.testHooks.afterCapacityWaitRegistered; hook != nil {
 			hook()
 		}
 		p.cond.Wait()
-		p.addWaiting(-1)
-		if atomic.LoadInt32(&p.state) != OPENED ||
-			p.generation.Load() != generation {
-			p.maybeManagedDoneLocked()
-			p.lock.Unlock()
-			return nil, nil, ErrPoolClosed
-		}
 	}
+}
+
+func (p *PoolWithID) acquireWaiterLocked(waiter *poolWithIDWaiter) bool {
+	if waiter.held {
+		return true
+	}
+	if p.options.MaxBlockingTasks != 0 && p.Waiting() >= p.options.MaxBlockingTasks {
+		return false
+	}
+	p.addWaiting(1)
+	waiter.held = true
+	return true
+}
+
+func (p *PoolWithID) releaseWaiterLocked(waiter *poolWithIDWaiter) {
+	if !waiter.held {
+		return
+	}
+	p.addWaiting(-1)
+	waiter.held = false
+	p.maybeManagedDoneLocked()
+}
+
+func (p *PoolWithID) reserveOwnerLocked(id int, generation uint64) *workerIDReservation {
+	p.nextAllocator++
+	reservation := &workerIDReservation{
+		id:         id,
+		registry:   p.registry,
+		generation: generation,
+		allocator:  p.nextAllocator,
+		state:      workerIDReservationPending,
+		done:       make(chan struct{}),
+	}
+	p.reservations[id] = reservation
+	p.reservedOwners.Add(1)
+	return reservation
+}
+
+func (p *PoolWithID) allocateReservedOwner(
+	reservation *workerIDReservation,
+	allocator uint64,
+) (entry *workerIDEntry, stop <-chan struct{}, err error) {
+	defer func() {
+		if panicValue := recover(); panicValue != nil {
+			p.abortReservation(reservation, allocator)
+			panic(panicValue)
+		}
+	}()
+
+	if hook := p.testHooks.beforeReservationAllocate; hook != nil {
+		hook(reservation.id)
+	}
+	now := time.Now().UnixNano()
+	entry = newWorkerIDEntry(
+		reservation.registry,
+		reservation.id,
+		p.admissionLimit*2,
+		now,
+	)
+	owner := newWorkerWithID(p, entry)
+	entry.owner = owner
+	if hook := p.testHooks.afterReservationAllocated; hook != nil {
+		hook(reservation.id)
+	}
+
+	stop, err = p.commitReservation(reservation, allocator, entry, owner)
+	if err != nil {
+		return nil, nil, err
+	}
+	if hook := p.testHooks.afterSubmitRegistered; hook != nil {
+		hook()
+	}
+	return entry, stop, nil
+}
+
+func (p *PoolWithID) commitReservation(
+	reservation *workerIDReservation,
+	allocator uint64,
+	entry *workerIDEntry,
+	owner *goWorkerWithID,
+) (<-chan struct{}, error) {
+	p.lock.Lock()
+	defer p.lock.Unlock()
+
+	if p.reservations[reservation.id] != reservation ||
+		reservation.allocator != allocator ||
+		reservation.state != workerIDReservationPending {
+		return nil, ErrPoolClosed
+	}
+	if atomic.LoadInt32(&p.state) != OPENED ||
+		p.generation.Load() != reservation.generation ||
+		p.registry != reservation.registry {
+		p.abortReservationLocked(reservation, allocator)
+		return nil, ErrPoolClosed
+	}
+
+	entry.pendingSubmits = 1
+	entry.outstanding = 1
+	reservation.registry.items[reservation.id] = entry
+	delete(p.reservations, reservation.id)
+	reservation.state = workerIDReservationCommitted
+	p.addRunning(1)
+	if hook := p.testHooks.duringReservationCapacityConvert; hook != nil {
+		hook(reservation.id)
+	}
+	p.reservedOwners.Add(-1)
+	close(reservation.done)
+	owner.run()
+	return p.submitStop, nil
+}
+
+func (p *PoolWithID) abortReservation(reservation *workerIDReservation, allocator uint64) {
+	p.lock.Lock()
+	p.abortReservationLocked(reservation, allocator)
+	p.lock.Unlock()
+}
+
+func (p *PoolWithID) abortReservationLocked(
+	reservation *workerIDReservation,
+	allocator uint64,
+) bool {
+	if p.reservations[reservation.id] != reservation ||
+		reservation.allocator != allocator ||
+		reservation.state != workerIDReservationPending {
+		return false
+	}
+	delete(p.reservations, reservation.id)
+	p.reservedOwners.Add(-1)
+	reservation.state = workerIDReservationAborted
+	close(reservation.done)
+	p.cond.Broadcast()
+	p.maybeManagedDoneLocked()
+	return true
 }
 
 func (p *PoolWithID) finishSubmit(entry *workerIDEntry, accepted bool) {
@@ -289,8 +461,7 @@ func (p *PoolWithID) finishSubmit(entry *workerIDEntry, accepted bool) {
 	}
 
 	state := atomic.LoadInt32(&p.state)
-	capacity := p.Cap()
-	if state != OPENED || (capacity > 0 && p.Running() > capacity) {
+	if state != OPENED || idleCandidate {
 		p.retireEntryIfDrained(entry, owner)
 	}
 }
@@ -337,9 +508,10 @@ func (p *PoolWithID) finishTask(owner *goWorkerWithID) bool {
 func (p *PoolWithID) retireOwnerIfDrained(owner *goWorkerWithID) bool {
 	state := atomic.LoadInt32(&p.state)
 	capacity := p.Cap()
+	reserved := int(p.reservedOwners.Load())
 	// Release transitions state and scans entries while holding p.lock, so the
 	// normal opened path does not need to contend with Submit on that lock.
-	if state == OPENED && (capacity <= 0 || p.Running() <= capacity) {
+	if state == OPENED && (capacity <= 0 || p.Running()+reserved <= capacity) {
 		return false
 	}
 
@@ -347,7 +519,8 @@ func (p *PoolWithID) retireOwnerIfDrained(owner *goWorkerWithID) bool {
 	p.lock.Lock()
 	state = atomic.LoadInt32(&p.state)
 	capacity = p.Cap()
-	overCapacity := capacity > 0 && len(p.registry.items) > capacity
+	overCapacity := capacity > 0 &&
+		len(p.registry.items)+int(p.reservedOwners.Load()) > capacity
 	if state == OPENED && !overCapacity {
 		p.maybeManagedDoneLocked()
 		p.lock.Unlock()
@@ -371,7 +544,8 @@ func (p *PoolWithID) retireEntryIfDrained(entry *workerIDEntry, owner *goWorkerW
 	p.lock.Lock()
 	state := atomic.LoadInt32(&p.state)
 	capacity := p.Cap()
-	overCapacity := capacity > 0 && len(p.registry.items) > capacity
+	overCapacity := capacity > 0 &&
+		len(p.registry.items)+int(p.reservedOwners.Load()) > capacity
 	if state == OPENED && !overCapacity {
 		p.maybeManagedDoneLocked()
 		p.lock.Unlock()
@@ -435,7 +609,8 @@ func (p *PoolWithID) ownerExited(owner *goWorkerWithID) {
 		entry.taskStartedAt = 0
 		entry.lastIdleAt = time.Now().UnixNano()
 		state := atomic.LoadInt32(&p.state)
-		overCapacity := p.Cap() > 0 && len(p.registry.items) > p.Cap()
+		overCapacity := p.Cap() > 0 &&
+			len(p.registry.items)+int(p.reservedOwners.Load()) > p.Cap()
 		if !entry.drained() || (state == OPENED && !overCapacity) {
 			replacement := newWorkerWithID(p, entry)
 			entry.owner = replacement
@@ -461,7 +636,7 @@ func (p *PoolWithID) ownerExited(owner *goWorkerWithID) {
 
 func (p *PoolWithID) maybeManagedDoneLocked() {
 	if atomic.LoadInt32(&p.state) == CLOSING && len(p.registry.items) == 0 &&
-		p.Running() == 0 && p.Waiting() == 0 {
+		p.reservedOwners.Load() == 0 && p.Running() == 0 && p.Waiting() == 0 {
 		p.managedOnce.Do(func() { close(p.managedDone) })
 	}
 }
@@ -604,6 +779,7 @@ func (p *PoolWithID) Reboot() {
 		}
 
 		p.registry = newWorkerIDRegistry()
+		p.reservations = make(map[int]*workerIDReservation)
 		p.submitStop = make(chan struct{})
 		p.managedDone = make(chan struct{})
 		p.closedDone = make(chan struct{})
@@ -638,7 +814,7 @@ func (p *PoolWithID) Tune(size int) {
 	}
 
 	registry := p.registry
-	excess := len(registry.items) - size
+	excess := len(registry.items) + int(p.reservedOwners.Load()) - size
 	var ownersToStop []*goWorkerWithID
 	registry.expiryMu.Lock()
 	for entry := registry.idle.head; entry != nil && excess > 0; {
@@ -789,7 +965,8 @@ func (p *PoolWithID) purgeExpired(now int64) {
 			entry.taskStartedAt = 0
 			entry.lastIdleAt = now
 			if entry.drained() {
-				overCapacity := p.Cap() > 0 && len(p.registry.items) > p.Cap()
+				overCapacity := p.Cap() > 0 &&
+					len(p.registry.items)+int(p.reservedOwners.Load()) > p.Cap()
 				if state == CLOSING || overCapacity {
 					if p.detachEntryLocked(entry, newOwner) {
 						ownersToStop = append(ownersToStop, newOwner)

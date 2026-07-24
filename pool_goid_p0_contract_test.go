@@ -125,8 +125,8 @@ func TestPoolWithIDCapacityReservedBeforeRegistryUnlock(t *testing.T) {
 	}()
 	poolWithIDReceive(t, barrier.unlocked)
 
-	if got := p.Running(); got != 1 {
-		t.Fatalf("Running() at registry unlock = %d, want reserved capacity 1", got)
+	if running, reserved := p.Running(), p.reservedOwners.Load(); running != 0 || reserved != 1 {
+		t.Fatalf("capacity at registry unlock = running:%d reserved:%d, want 0/1", running, reserved)
 	}
 	secondResult := make(chan error, 1)
 	go func() {
