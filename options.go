@@ -86,9 +86,9 @@ type Options struct {
 	DisablePurge bool
 
 	// TaskBuffer is the PoolWithID admission limit for each ID. The physical
-	// task channel has twice this capacity. Zero uses an admission limit of 10
-	// and a physical capacity of 20; negative values and values that overflow
-	// when doubled are rejected by NewPoolWithID.
+	// task channel has twice this capacity. Zero uses DefaultTaskBuffer and a
+	// physical capacity of 2*DefaultTaskBuffer. Negative values and values above
+	// MaxTaskBuffer are rejected by NewPoolWithID.
 	//
 	// Nonblocking submissions reject when the observed queue length reaches this
 	// limit. The check and send are not serialized, so concurrent submissions
@@ -181,9 +181,9 @@ func WithDisablePurgeRunning(disable bool) Option {
 }
 
 // WithTaskBuffer sets the PoolWithID admission limit for each ID. Its physical
-// task channel capacity is twice taskBuffer; zero selects the default limit 10
-// and capacity 20. Negative values and values that overflow when doubled make
-// NewPoolWithID return ErrInvalidPoolWithIDTaskBuffer.
+// task channel capacity is twice taskBuffer; zero selects DefaultTaskBuffer.
+// Negative values and values above MaxTaskBuffer make NewPoolWithID return
+// ErrInvalidPoolWithIDTaskBuffer.
 //
 // In nonblocking mode, submissions reject once the observed queue length
 // reaches the admission limit and always use a final nonblocking send. Because

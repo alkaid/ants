@@ -58,6 +58,8 @@ func TestPoolWithIDPublicAPI(t *testing.T) {
 	require.NotEqual(t, ants.PoolWithIDWorkerEscaped, ants.PoolWithIDEscapedWorkerExited)
 	require.NotEqual(t, ants.OPENED, ants.CLOSING)
 	require.Equal(t, 10, ants.MinTaskBuffer)
+	require.Equal(t, 100, ants.DefaultTaskBuffer)
+	require.Equal(t, 64*1024, ants.MaxTaskBuffer)
 
 	now := time.Now()
 	event := ants.PoolWithIDEscapeEvent{
@@ -155,7 +157,7 @@ func TestPoolWithIDTaskBufferPublicContract(t *testing.T) {
 				ants.WithNonblocking(true),
 				ants.WithDisablePurge(true),
 			},
-			admission: ants.MinTaskBuffer,
+			admission: ants.DefaultTaskBuffer,
 		},
 		{
 			name: "positive value is admission limit",

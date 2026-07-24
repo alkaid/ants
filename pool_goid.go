@@ -31,9 +31,18 @@ import (
 	"time"
 )
 
-// MinTaskBuffer is the default admission limit for a PoolWithID task queue.
-// The physical queue capacity is twice this value.
-const MinTaskBuffer = 10
+const (
+	// MinTaskBuffer is retained for source compatibility.
+	//
+	// Deprecated: use DefaultTaskBuffer for the default admission limit.
+	MinTaskBuffer = 10
+
+	// DefaultTaskBuffer is the default PoolWithID admission limit per ID.
+	DefaultTaskBuffer = 100
+
+	// MaxTaskBuffer is the largest PoolWithID admission limit accepted per ID.
+	MaxTaskBuffer = 64 * 1024
+)
 
 // poolWithIDBackgroundStartHook is a signal-only test seam. Production code
 // leaves it nil.
@@ -152,9 +161,9 @@ func (p *PoolWithID) Submit(id int, task func()) error {
 // []Option slices, and WithOptions. WithPreAlloc(true) is accepted but does not
 // preallocate or reuse ID workers.
 //
-// TaskBuffer is normalized to a default admission limit of 10 when it is zero;
-// the physical per-ID queue has twice the configured admission capacity. A
-// negative value or one that overflows when doubled returns
+// TaskBuffer is normalized to DefaultTaskBuffer when it is zero; the physical
+// per-ID queue has twice the configured admission capacity. A negative value
+// or one above MaxTaskBuffer returns
 // ErrInvalidPoolWithIDTaskBuffer before background goroutines are started.
 func NewPoolWithID(size int, options ...Option) (*PoolWithID, error) {
 	pc, err := newPoolCommon(size, false, options...)
@@ -163,11 +172,10 @@ func NewPoolWithID(size int, options ...Option) (*PoolWithID, error) {
 	}
 
 	limit := pc.options.TaskBuffer
-	maxInt := int(^uint(0) >> 1)
 	if limit == 0 {
-		limit = MinTaskBuffer
+		limit = DefaultTaskBuffer
 	}
-	if limit < 0 || limit > maxInt/2 {
+	if limit < 0 || limit > MaxTaskBuffer {
 		return nil, ErrInvalidPoolWithIDTaskBuffer
 	}
 	pc.options.TaskBuffer = limit

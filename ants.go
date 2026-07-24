@@ -80,7 +80,7 @@ var (
 	ErrInvalidPreAllocSize = errors.New("can not set up a negative capacity under PreAlloc mode")
 
 	// ErrInvalidPoolWithIDTaskBuffer is returned when the PoolWithID admission
-	// limit is negative or too large to allocate its bounded task queue.
+	// limit is negative or exceeds MaxTaskBuffer.
 	ErrInvalidPoolWithIDTaskBuffer = errors.New("invalid task buffer for PoolWithID")
 
 	// ErrTimeout will be returned after the operations timed out.

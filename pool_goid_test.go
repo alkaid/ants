@@ -89,8 +89,8 @@ func poolWithIDEntryForTest(t *testing.T, p *PoolWithID, id int) *workerIDEntry 
 func TestPoolWithIDTaskBufferConfiguration(t *testing.T) {
 	t.Run("default", func(t *testing.T) {
 		p := newPoolWithIDForTest(t, 1, WithDisablePurge(true))
-		if p.admissionLimit != MinTaskBuffer {
-			t.Fatalf("admission limit = %d, want %d", p.admissionLimit, MinTaskBuffer)
+		if p.admissionLimit != DefaultTaskBuffer {
+			t.Fatalf("admission limit = %d, want %d", p.admissionLimit, DefaultTaskBuffer)
 		}
 
 		started := make(chan struct{})
@@ -103,7 +103,7 @@ func TestPoolWithIDTaskBufferConfiguration(t *testing.T) {
 			t.Fatalf("Submit() error = %v", err)
 		}
 		poolWithIDReceive(t, started)
-		if got, want := cap(poolWithIDEntryForTest(t, p, 1).tasks), 2*MinTaskBuffer; got != want {
+		if got, want := cap(poolWithIDEntryForTest(t, p, 1).tasks), 2*DefaultTaskBuffer; got != want {
 			t.Fatalf("physical task capacity = %d, want %d", got, want)
 		}
 		closeUnblock()
@@ -133,7 +133,7 @@ func TestPoolWithIDTaskBufferConfiguration(t *testing.T) {
 
 	t.Run("invalid final value", func(t *testing.T) {
 		maxInt := int(^uint(0) >> 1)
-		for _, taskBuffer := range []int{-1, maxInt/2 + 1} {
+		for _, taskBuffer := range []int{-1, MaxTaskBuffer + 1, maxInt / 2} {
 			p, err := NewPoolWithID(1, WithTaskBuffer(taskBuffer))
 			if !errors.Is(err, ErrInvalidPoolWithIDTaskBuffer) {
 				t.Fatalf("NewPoolWithID(TaskBuffer=%d) error = %v, want %v", taskBuffer, err, ErrInvalidPoolWithIDTaskBuffer)
@@ -141,6 +141,18 @@ func TestPoolWithIDTaskBufferConfiguration(t *testing.T) {
 			if p != nil {
 				t.Fatalf("NewPoolWithID(TaskBuffer=%d) returned non-nil pool", taskBuffer)
 			}
+		}
+	})
+
+	t.Run("maximum", func(t *testing.T) {
+		p := newPoolWithIDForTest(t, 1, WithTaskBuffer(MaxTaskBuffer), WithDisablePurge(true))
+		finished := make(chan struct{})
+		if err := p.Submit(1, func() { close(finished) }); err != nil {
+			t.Fatalf("Submit() at MaxTaskBuffer: %v", err)
+		}
+		poolWithIDReceive(t, finished)
+		if got, want := cap(poolWithIDEntryForTest(t, p, 1).tasks), 2*MaxTaskBuffer; got != want {
+			t.Fatalf("physical task capacity = %d, want %d", got, want)
 		}
 	})
 
@@ -202,7 +214,7 @@ func TestPoolWithIDInvalidTaskBufferStartsNoBackground(t *testing.T) {
 	t.Cleanup(func() { poolWithIDBackgroundStartHook = nil })
 
 	maxInt := int(^uint(0) >> 1)
-	for _, taskBuffer := range []int{-1, maxInt/2 + 1} {
+	for _, taskBuffer := range []int{-1, MaxTaskBuffer + 1, maxInt / 2} {
 		pool, err := NewPoolWithID(1, WithTaskBuffer(taskBuffer))
 		if pool != nil || !errors.Is(err, ErrInvalidPoolWithIDTaskBuffer) {
 			t.Fatalf("NewPoolWithID(TaskBuffer=%d) = (%v, %v), want (nil, %v)",
