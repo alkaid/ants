@@ -23,27 +23,16 @@ func newPoolWithIDForP2StructureTest(t *testing.T) *PoolWithID {
 	t.Cleanup(func() {
 		p.lock.Lock()
 		purgeCancel := p.purgeCancel
-		tickCancel := p.tickCancel
 		purgeFinished := p.purgeFinished
-		tickFinished := p.tickFinished
 		p.purgeCancel = nil
-		p.tickCancel = nil
 		p.lock.Unlock()
 		if purgeCancel != nil {
 			purgeCancel()
-		}
-		if tickCancel != nil {
-			tickCancel()
 		}
 		select {
 		case <-purgeFinished:
 		case <-time.After(poolWithIDTestTimeout):
 			t.Error("timed out stopping purge loop")
-		}
-		select {
-		case <-tickFinished:
-		case <-time.After(poolWithIDTestTimeout):
-			t.Error("timed out stopping clock loop")
 		}
 	})
 	return p

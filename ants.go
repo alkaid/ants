@@ -393,7 +393,7 @@ func (p *poolCommon) Free() int {
 	return c - p.Running()
 }
 
-// Waiting returns the number of tasks waiting to be executed.
+// Waiting returns the number of Submit calls currently blocked by the pool.
 func (p *poolCommon) Waiting() int {
 	return int(atomic.LoadInt32(&p.waiting))
 }

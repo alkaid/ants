@@ -606,7 +606,7 @@ func TestPoolWithIDBlockingQueueWaitsForSpaceAndClose(t *testing.T) {
 	})
 }
 
-func TestPoolWithIDMaxBlockingTasksOnlyLimitsNewIDs(t *testing.T) {
+func TestPoolWithIDMaxBlockingTasksCoversCapacityAndQueueWaits(t *testing.T) {
 	p := newPoolWithIDForTest(t, 1,
 		WithTaskBuffer(1),
 		WithMaxBlockingTasks(1),
@@ -650,24 +650,22 @@ func TestPoolWithIDMaxBlockingTasksOnlyLimitsNewIDs(t *testing.T) {
 		}
 	}
 	existingResult := make(chan error, 1)
-	existingRan := make(chan struct{})
 	existingRegistered := make(chan struct{})
 	p.testHooks.afterSubmitRegistered = func() { close(existingRegistered) }
 	go func() {
-		existingResult <- p.Submit(1, func() { close(existingRan) })
+		existingResult <- p.Submit(1, func() {})
 	}()
 	poolWithIDReceive(t, existingRegistered)
 	p.testHooks.afterSubmitRegistered = nil
+	if err := poolWithIDReceive(t, existingResult); !errors.Is(err, ErrPoolOverload) {
+		t.Fatalf("existing-ID queue waiter error = %v, want %v", err, ErrPoolOverload)
+	}
 	if got := p.Waiting(); got != 1 {
-		t.Fatalf("capacity waiters changed to %d for an existing-ID queue wait, want 1", got)
+		t.Fatalf("waiter total changed to %d after queue overload, want 1", got)
 	}
 
 	closeRunningGate()
-	if err := poolWithIDReceive(t, existingResult); err != nil {
-		t.Fatalf("existing-ID Submit() after space became available error = %v", err)
-	}
 	closeQueuedGate()
-	poolWithIDReceive(t, existingRan)
 
 	p.Release()
 	if err := poolWithIDReceive(t, newIDResult); !errors.Is(err, ErrPoolClosed) {

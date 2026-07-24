@@ -82,8 +82,6 @@ type PoolWithID struct {
 
 	purgeCancel   context.CancelFunc
 	purgeFinished chan struct{}
-	tickCancel    context.CancelFunc
-	tickFinished  chan struct{}
 
 	escape *poolWithIDEscapeState
 
@@ -95,6 +93,8 @@ type poolWithIDTestHooks struct {
 	afterSubmitRegistered            func()
 	beforeSubmitFinished             func()
 	afterCapacityWaitRegistered      func()
+	afterQueueFastSendMiss           func()
+	afterQueueWaitRegistered         func()
 	afterTaskFinished                func()
 	beforeOwnerExited                func(*goWorkerWithID)
 	beforeReservationAllocate        func(int)
@@ -146,9 +146,9 @@ type poolWithIDWaiter struct {
 //
 // In blocking mode, a new ID waits for owner capacity subject to
 // MaxBlockingTasks. An existing ID may use the full physical queue and then
-// waits for queue space or pool closure; MaxBlockingTasks does not limit that
-// queue wait. A task that recursively submits to its own full queue in blocking
-// mode is not guaranteed to make progress.
+// waits for queue space or pool closure subject to the same MaxBlockingTasks
+// limit. A task that recursively submits to its own full queue in blocking mode
+// is not guaranteed to make progress.
 func (p *PoolWithID) Submit(id int, task func()) error {
 	generation := p.generation.Load()
 	waiter := poolWithIDWaiter{}
@@ -183,13 +183,62 @@ func (p *PoolWithID) Submit(id int, task func()) error {
 		}
 	}
 
+	if err := p.submitBlocking(entry, stop, generation, task, &waiter); err != nil {
+		return err
+	}
+	accepted = true
+	return nil
+}
+
+func (p *PoolWithID) submitBlocking(
+	entry *workerIDEntry,
+	stop <-chan struct{},
+	generation uint64,
+	task func(),
+	waiter *poolWithIDWaiter,
+) error {
 	select {
 	case entry.tasks <- task:
-		accepted = true
 		return nil
-	case <-stop:
+	default:
+	}
+	if hook := p.testHooks.afterQueueFastSendMiss; hook != nil {
+		hook()
+	}
+
+	p.lock.Lock()
+	if atomic.LoadInt32(&p.state) != OPENED || p.generation.Load() != generation {
+		p.releaseWaiterLocked(waiter)
+		p.lock.Unlock()
 		return ErrPoolClosed
 	}
+	select {
+	case entry.tasks <- task:
+		p.releaseWaiterLocked(waiter)
+		p.lock.Unlock()
+		return nil
+	default:
+	}
+	if !p.acquireWaiterLocked(waiter) {
+		p.releaseWaiterLocked(waiter)
+		p.lock.Unlock()
+		return ErrPoolOverload
+	}
+	if hook := p.testHooks.afterQueueWaitRegistered; hook != nil {
+		hook()
+	}
+	p.lock.Unlock()
+
+	var err error
+	select {
+	case entry.tasks <- task:
+	case <-stop:
+		err = ErrPoolClosed
+	}
+	p.lock.Lock()
+	p.releaseWaiterLocked(waiter)
+	p.lock.Unlock()
+	return err
 }
 
 // NewPoolWithID instantiates a PoolWithID with the same public Option type used
@@ -245,7 +294,6 @@ func NewPoolWithID(size int, options ...Option) (*PoolWithID, error) {
 		purgeWake:      make(chan struct{}, 1),
 		escape:         newPoolWithIDEscapeState(globalBudget, perIDBudget),
 		purgeFinished:  make(chan struct{}),
-		tickFinished:   make(chan struct{}),
 	}
 	p.generation.Store(1)
 	p.startIDBackgroundLocked()
@@ -761,18 +809,17 @@ func (p *PoolWithID) startRelease() (<-chan struct{}, bool) {
 
 	managedDone := p.managedDone
 	purgeFinished := p.purgeFinished
-	tickFinished := p.tickFinished
 	closedDone := p.closedDone
 	generation := p.generation.Load()
 	p.lock.Unlock()
 
-	go p.awaitClosed(generation, managedDone, purgeFinished, tickFinished, closedDone)
+	go p.awaitClosed(generation, managedDone, purgeFinished, closedDone)
 	return closedDone, false
 }
 
 func (p *PoolWithID) awaitClosed(
 	generation uint64,
-	managedDone, purgeFinished, tickFinished, closedDone chan struct{},
+	managedDone, purgeFinished, closedDone chan struct{},
 ) {
 	<-managedDone
 	if hook := p.testHooks.afterManagedCloseFence; hook != nil {
@@ -782,18 +829,12 @@ func (p *PoolWithID) awaitClosed(
 	p.lock.Lock()
 	purgeCancel := p.purgeCancel
 	p.purgeCancel = nil
-	tickCancel := p.tickCancel
-	p.tickCancel = nil
 	p.lock.Unlock()
 	if purgeCancel != nil {
 		purgeCancel()
 	}
-	if tickCancel != nil {
-		tickCancel()
-	}
 
 	<-purgeFinished
-	<-tickFinished
 
 	p.lock.Lock()
 	if atomic.LoadInt32(&p.state) == CLOSING && p.closedDone == closedDone {
@@ -892,13 +933,6 @@ func (p *PoolWithID) startIDBackgroundLocked() {
 	if hook := poolWithIDBackgroundStartHook; hook != nil {
 		hook()
 	}
-	atomic.StoreInt64(&p.now, time.Now().UnixNano())
-
-	tickCtx, tickCancel := context.WithCancel(context.Background())
-	p.tickCancel = tickCancel
-	p.tickFinished = make(chan struct{})
-	go p.tickIDClock(tickCtx, p.tickFinished)
-
 	p.purgeFinished = make(chan struct{})
 	if p.options.DisablePurge {
 		close(p.purgeFinished)
@@ -908,22 +942,6 @@ func (p *PoolWithID) startIDBackgroundLocked() {
 	purgeCtx, purgeCancel := context.WithCancel(context.Background())
 	p.purgeCancel = purgeCancel
 	go p.purgeIDs(purgeCtx, p.purgeFinished)
-}
-
-func (p *PoolWithID) tickIDClock(ctx context.Context, finished chan struct{}) {
-	ticker := time.NewTicker(nowTimeUpdateInterval)
-	defer func() {
-		ticker.Stop()
-		close(finished)
-	}()
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case now := <-ticker.C:
-			atomic.StoreInt64(&p.now, now.UnixNano())
-		}
-	}
 }
 
 func (p *PoolWithID) purgeIDs(ctx context.Context, finished chan struct{}) {

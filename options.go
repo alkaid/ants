@@ -53,8 +53,8 @@ type Options struct {
 
 	// Max number of goroutine blocking on pool.Submit.
 	// 0 (default value) means no such limit.
-	// For PoolWithID this only limits callers waiting for owner capacity for a
-	// new ID; it does not limit queue-space waits for an existing ID.
+	// For PoolWithID this covers owner-capacity waits, reservation followers,
+	// and queue-space waits for an existing ID.
 	MaxBlockingTasks int
 
 	// When Nonblocking is true, Pool.Submit will never be blocked.
@@ -90,9 +90,8 @@ type Options struct {
 	// may use the reserved half between TaskBuffer and 2*TaskBuffer; a final
 	// nonblocking send still rejects if the physical channel is full. Blocking
 	// submissions may use the full physical capacity and then wait for space or
-	// pool closure. MaxBlockingTasks does not limit this existing-ID wait, and a
-	// blocking task that recursively submits to its own full queue is not
-	// guaranteed to make progress.
+	// pool closure subject to MaxBlockingTasks. A blocking task that recursively
+	// submits to its own full queue is not guaranteed to make progress.
 	TaskBuffer int
 
 	// DisablePurgeRunning prevents PoolWithID from escaping an owner whose task
@@ -154,9 +153,9 @@ func WithPreAlloc(preAlloc bool) Option {
 	}
 }
 
-// WithMaxBlockingTasks sets up the maximum number of goroutines that are
-// blocked when a pool reaches owner capacity. For PoolWithID it does not apply
-// to queue-space waits for an ID that already exists.
+// WithMaxBlockingTasks sets up the maximum number of goroutines blocked in
+// Submit. For PoolWithID it covers owner capacity, reservation followers, and
+// existing-ID queue space.
 func WithMaxBlockingTasks(maxBlockingTasks int) Option {
 	return func(opts *Options) {
 		opts.MaxBlockingTasks = maxBlockingTasks
@@ -231,9 +230,9 @@ func WithMaxEscapedWorkersPerID(limit int) Option {
 // reaches the admission limit and always use a final nonblocking send. Because
 // the check and send are not serialized, concurrent submissions may use the
 // reserved half of the channel. In blocking mode, submissions may use the full
-// channel and wait for space or closure; MaxBlockingTasks does not limit this
-// existing-ID wait. A task that recursively submits to its own full queue in
-// blocking mode is not guaranteed to make progress.
+// channel and wait for space or closure subject to MaxBlockingTasks. A task
+// that recursively submits to its own full queue in blocking mode is not
+// guaranteed to make progress.
 func WithTaskBuffer(taskBuffer int) Option {
 	return func(opts *Options) {
 		opts.TaskBuffer = taskBuffer
