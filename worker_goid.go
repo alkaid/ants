@@ -30,8 +30,9 @@ import (
 // it starts a goroutine that accepts tasks and
 // performs function calls.
 type goWorkerWithID struct {
-	pool  *PoolWithID
-	entry *workerIDEntry
+	pool       *PoolWithID
+	entry      *workerIDEntry
+	generation uint64
 	// stop is closed either to retire this owner or after its escape transition
 	// has been recorded. Those states are mutually exclusive for one owner.
 	stop chan struct{}
@@ -39,9 +40,10 @@ type goWorkerWithID struct {
 
 func newWorkerWithID(pool *PoolWithID, entry *workerIDEntry) *goWorkerWithID {
 	return &goWorkerWithID{
-		pool:  pool,
-		entry: entry,
-		stop:  make(chan struct{}),
+		pool:       pool,
+		entry:      entry,
+		generation: entry.generation,
+		stop:       make(chan struct{}),
 	}
 }
 
@@ -73,12 +75,23 @@ func (w *goWorkerWithID) loop() {
 				return
 			}
 
-			w.execute(task)
+			panicValue, stack := w.execute(task)
+			panicHandled := false
+			if panicValue != nil && w.pool.isManagedOwner(w) {
+				w.pool.handleTaskPanic(w.entry.id, panicValue, stack)
+				panicHandled = true
+			}
 			if w.pool.finishTask(w) {
 				managedOwner = false
 				<-w.stop
 				w.pool.escapedWorkerExited(w)
+				if panicValue != nil && !panicHandled {
+					w.pool.handleTaskPanic(w.entry.id, panicValue, stack)
+				}
 				return
+			}
+			if panicValue != nil && !panicHandled {
+				w.pool.handleTaskPanic(w.entry.id, panicValue, stack)
 			}
 			if hook := w.pool.testHooks.afterTaskFinished; hook != nil {
 				hook()
@@ -93,11 +106,13 @@ func (w *goWorkerWithID) loop() {
 	}
 }
 
-func (w *goWorkerWithID) execute(task func()) {
+func (w *goWorkerWithID) execute(task func()) (panicValue any, stack []byte) {
 	defer func() {
 		if p := recover(); p != nil {
-			w.pool.handleTaskPanic(w.entry.id, p, debug.Stack())
+			panicValue = p
+			stack = debug.Stack()
 		}
 	}()
 	task()
+	return nil, nil
 }

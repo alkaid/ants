@@ -49,6 +49,14 @@ const (
 
 	// DefaultCleanIntervalTime is the interval time to clean up goroutines.
 	DefaultCleanIntervalTime = time.Second
+
+	// DefaultPoolWithIDExpiryDuration is the default idle-owner expiry for
+	// PoolWithID.
+	DefaultPoolWithIDExpiryDuration = 30 * time.Second
+
+	// DefaultRunningTaskTimeout is the default PoolWithID running-task escape
+	// threshold.
+	DefaultRunningTaskTimeout = 5 * time.Minute
 )
 
 const (
@@ -82,6 +90,14 @@ var (
 	// ErrInvalidPoolWithIDTaskBuffer is returned when the PoolWithID admission
 	// limit is negative or exceeds MaxTaskBuffer.
 	ErrInvalidPoolWithIDTaskBuffer = errors.New("invalid task buffer for PoolWithID")
+
+	// ErrInvalidPoolWithIDRunningTaskTimeout is returned when PoolWithID is
+	// configured with a negative running-task timeout.
+	ErrInvalidPoolWithIDRunningTaskTimeout = errors.New("invalid running task timeout for PoolWithID")
+
+	// ErrInvalidPoolWithIDEscapeBudget is returned when either PoolWithID escape
+	// budget is negative.
+	ErrInvalidPoolWithIDEscapeBudget = errors.New("invalid escape budget for PoolWithID")
 
 	// ErrTimeout will be returned after the operations timed out.
 	ErrTimeout = errors.New("operation timed out")
@@ -223,6 +239,9 @@ func newPool(size int, options ...Option) (*poolCommon, error) {
 	if err != nil {
 		return nil, err
 	}
+	if !p.options.DisablePurge && p.options.ExpiryDuration == 0 {
+		p.options.ExpiryDuration = DefaultCleanIntervalTime
+	}
 	p.startBackground()
 	return p, nil
 }
@@ -240,8 +259,6 @@ func newPoolCommon(size int, allocateWorkerQueue bool, options ...Option) (*pool
 	if !opts.DisablePurge {
 		if expiry := opts.ExpiryDuration; expiry < 0 {
 			return nil, ErrInvalidPoolExpiry
-		} else if expiry == 0 {
-			opts.ExpiryDuration = DefaultCleanIntervalTime
 		}
 	}
 

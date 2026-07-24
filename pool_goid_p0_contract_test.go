@@ -88,7 +88,7 @@ func TestPoolWithIDPendingSubmitSurvivesSyntheticPurge(t *testing.T) {
 	}
 	entry.mu.Unlock()
 
-	p.purgeExpired(lastIdleAt + int64(p.options.ExpiryDuration))
+	p.purgeExpired(lastIdleAt.Add(p.options.ExpiryDuration))
 	currentEntry, currentOwner, _ := poolWithIDObserveEntryState(t, p, id)
 	if currentEntry != entry || currentOwner != owner {
 		t.Fatal("purge retired an entry with a registered submit")
@@ -238,7 +238,7 @@ func TestPoolWithIDRunningPlusEscapedMatchesLiveWorkers(t *testing.T) {
 	}
 
 	_, _, startedAt := poolWithIDObserveEntryState(t, p, id)
-	p.purgeExpired(startedAt + int64(p.options.ExpiryDuration))
+	p.purgeExpired(startedAt.Add(p.options.RunningTaskTimeout))
 	poolWithIDObserveReceive(t, p.EscapeEvents(), "task A escape")
 	poolWithIDObserveReceive(t, bStarted, "task B start")
 

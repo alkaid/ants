@@ -53,9 +53,9 @@ func poolWithIDP2AddSyntheticEntry(
 	p *PoolWithID,
 	id int,
 	kind workerIDEntryListKind,
-	timestamp int64,
+	timestamp time.Time,
 ) *workerIDEntry {
-	entry := newWorkerIDEntry(p.registry, id, 0, timestamp)
+	entry := newWorkerIDEntry(p.registry, id, 0, p.generation.Load(), timestamp)
 	entry.owner = newWorkerWithID(p, entry)
 	if kind == workerIDEntryListRunning {
 		entry.taskStartedAt = timestamp
@@ -125,7 +125,7 @@ func TestPoolWithIDEntryRegistryRemainsStableAcrossReboot(t *testing.T) {
 			}
 			entry, _, startedAt := poolWithIDObserveEntryState(t, p, id)
 			oldRegistry := entry.registry
-			p.purgeExpired(startedAt + int64(p.options.ExpiryDuration))
+			p.purgeExpired(startedAt.Add(p.options.RunningTaskTimeout))
 			poolWithIDReceive(t, replacementFinished)
 			poolWithIDReceive(t, p.EscapeEvents())
 
@@ -185,9 +185,9 @@ func poolWithIDP2AssertList(
 func TestWorkerIDRegistryExpiryListTransitions(t *testing.T) {
 	registry := newWorkerIDRegistry()
 	entries := []*workerIDEntry{
-		newWorkerIDEntry(registry, 1, 0, 1),
-		newWorkerIDEntry(registry, 2, 0, 2),
-		newWorkerIDEntry(registry, 3, 0, 3),
+		newWorkerIDEntry(registry, 1, 0, 1, time.Unix(0, 1)),
+		newWorkerIDEntry(registry, 2, 0, 1, time.Unix(0, 2)),
+		newWorkerIDEntry(registry, 3, 0, 1, time.Unix(0, 3)),
 	}
 
 	registry.expiryMu.Lock()
@@ -215,15 +215,15 @@ func TestWorkerIDRegistryExpiryListTransitions(t *testing.T) {
 func TestWorkerIDRegistryPurgeVisitsOnlyIdleExpiryPrefix(t *testing.T) {
 	p := newPoolWithIDForP2StructureTest(t)
 	const expired = 37
-	now := time.Now().UnixNano()
-	expiry := int64(p.options.ExpiryDuration)
+	now := time.Now()
+	expiry := p.options.ExpiryDuration
 
 	p.lock.Lock()
 	p.registry.expiryMu.Lock()
 	for id := 0; id < poolWithIDP2StructuralEntries; id++ {
-		idleAt := now - expiry + 1 + int64(id)
+		idleAt := now.Add(-expiry + time.Nanosecond + time.Duration(id)*time.Nanosecond)
 		if id < expired {
-			idleAt = now - expiry - int64(expired-id)
+			idleAt = now.Add(-expiry - time.Duration(expired-id)*time.Nanosecond)
 		}
 		poolWithIDP2AddSyntheticEntry(p, id, workerIDEntryListIdle, idleAt)
 	}
@@ -257,13 +257,13 @@ func TestWorkerIDRegistryPurgeVisitsOnlyIdleExpiryPrefix(t *testing.T) {
 
 func TestWorkerIDRegistryPurgeVisitsOneUnexpiredRunningOwner(t *testing.T) {
 	p := newPoolWithIDForP2StructureTest(t)
-	now := time.Now().UnixNano()
-	expiry := int64(p.options.ExpiryDuration)
+	now := time.Now()
+	timeout := p.options.RunningTaskTimeout
 
 	p.lock.Lock()
 	p.registry.expiryMu.Lock()
 	for id := 0; id < poolWithIDP2StructuralEntries; id++ {
-		startedAt := now - expiry + 1 + int64(id)
+		startedAt := now.Add(-timeout + time.Nanosecond + time.Duration(id)*time.Nanosecond)
 		poolWithIDP2AddSyntheticEntry(p, id, workerIDEntryListRunning, startedAt)
 	}
 	p.registry.expiryMu.Unlock()
@@ -300,11 +300,12 @@ func TestWorkerIDRegistryPurgeVisitsRunningExpiryPrefix(t *testing.T) {
 		t,
 		total,
 		WithExpiryDuration(time.Hour),
+		WithMaxEscapedWorkers(expired),
 		WithTaskBuffer(1),
 	)
 	releaseTasks := make(chan struct{})
 	closeReleaseTasks := poolWithIDCloseOnCleanup(t, releaseTasks)
-	startedAt := make([]int64, total)
+	startedAt := make([]time.Time, total)
 	returned := make(chan struct{}, total)
 
 	for id := 0; id < total; id++ {
@@ -319,14 +320,14 @@ func TestWorkerIDRegistryPurgeVisitsRunningExpiryPrefix(t *testing.T) {
 		poolWithIDReceive(t, started)
 		_, _, startedAt[id] = poolWithIDObserveEntryState(t, p, id)
 	}
-	if startedAt[expired] <= startedAt[expired-1] {
-		t.Fatalf("running timestamps are not ordered: %d then %d",
+	if !startedAt[expired].After(startedAt[expired-1]) {
+		t.Fatalf("running timestamps are not ordered: %v then %v",
 			startedAt[expired-1], startedAt[expired])
 	}
 
 	var visited atomic.Int64
 	p.testHooks.afterPurgeEntryVisited = func() { visited.Add(1) }
-	p.purgeExpired(startedAt[expired-1] + int64(p.options.ExpiryDuration))
+	p.purgeExpired(startedAt[expired-1].Add(p.options.RunningTaskTimeout))
 	if got, want := visited.Load(), int64(expired+1); got != want {
 		t.Fatalf("purge visited %d running entries, want %d", got, want)
 	}

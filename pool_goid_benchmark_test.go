@@ -335,7 +335,7 @@ func BenchmarkPoolWithIDPurge(b *testing.B) {
 
 			var scanned atomic.Int64
 			p.testHooks.afterPurgeEntryVisited = func() { scanned.Add(1) }
-			now := time.Now().UnixNano()
+			now := time.Now()
 			samples := poolWithIDBenchmarkSamples(b.N)
 			b.ReportAllocs()
 			measuredLock.reset()
@@ -361,7 +361,7 @@ func BenchmarkPoolWithIDPurge(b *testing.B) {
 
 			var scanned atomic.Int64
 			p.testHooks.afterPurgeEntryVisited = func() { scanned.Add(1) }
-			now := time.Now().UnixNano()
+			now := time.Now()
 			samples := poolWithIDBenchmarkSamples(b.N)
 			b.ReportAllocs()
 			measuredLock.reset()
@@ -512,7 +512,7 @@ func BenchmarkPoolWithIDSteadyState(b *testing.B) {
 					completedBefore+batch,
 				)
 				poolWithIDBenchmarkWaitForIdle(b, p, int(batch))
-				p.purgeExpired(time.Now().Add(2 * time.Hour).UnixNano())
+				p.purgeExpired(time.Now().Add(2 * time.Hour))
 				poolWithIDBenchmarkWaitForEmptyRegistry(b, p)
 			}
 			elapsed := time.Since(startedAt)

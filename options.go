@@ -42,14 +42,9 @@ func loadOptions(options ...Option) *Options {
 // keyed literals or Option functions: unkeyed Options literals are compatible
 // only when they contain every field in this version's exact order.
 type Options struct {
-	// ExpiryDuration is a period for the scavenger goroutine to clean up those expired workers,
-	// the scavenger scans all workers every `ExpiryDuration` and clean up those workers that haven't been
-	// used for more than `ExpiryDuration`. For PoolWithID it is also measured
-	// from the start of each task's execution. Once a running task reaches this
-	// escape threshold, a replacement owner takes over the same ID queue unless
-	// running purge is disabled. This is not an end-to-end deadline measured
-	// from Submit, and it cannot stop the escaped task or prevent late side
-	// effects.
+	// ExpiryDuration controls when idle workers are scavenged. For PoolWithID it
+	// applies only to idle owners; RunningTaskTimeout independently controls
+	// running-task escape.
 	ExpiryDuration time.Duration
 
 	// PreAlloc indicates whether to make memory pre-allocation when initializing Pool.
@@ -101,9 +96,27 @@ type Options struct {
 	TaskBuffer int
 
 	// DisablePurgeRunning prevents PoolWithID from escaping an owner whose task
-	// exceeds ExpiryDuration. A permanently blocked task can then block that ID
-	// permanently. This option has no effect on other pool types.
+	// exceeds RunningTaskTimeout. A permanently blocked task can then block that
+	// ID permanently. This option has no effect on other pool types.
 	DisablePurgeRunning bool
+
+	// RunningTaskTimeout is the PoolWithID threshold for replacing an owner
+	// whose task is still running. Zero selects DefaultRunningTaskTimeout. A
+	// negative value makes NewPoolWithID return
+	// ErrInvalidPoolWithIDRunningTaskTimeout. This option has no effect on other
+	// pool types.
+	RunningTaskTimeout time.Duration
+
+	// MaxEscapedWorkers is the global limit for PoolWithID tasks that escaped
+	// their managed owners but remain alive. Zero selects a capacity-dependent
+	// default; a positive value is fixed across Tune calls. A negative value
+	// makes NewPoolWithID return ErrInvalidPoolWithIDEscapeBudget.
+	MaxEscapedWorkers int
+
+	// MaxEscapedWorkersPerID limits live escaped workers for one PoolWithID ID.
+	// Zero selects the default of one. A negative value makes NewPoolWithID
+	// return ErrInvalidPoolWithIDEscapeBudget.
+	MaxEscapedWorkersPerID int
 }
 
 // WithOptions accepts the whole Options config. Prefer a keyed Options literal
@@ -114,12 +127,22 @@ func WithOptions(options Options) Option {
 	}
 }
 
-// WithExpiryDuration sets up the interval time of cleaning up goroutines. For
-// PoolWithID it also sets the running-task escape threshold, measured from the
-// start of task execution rather than from Submit.
+// WithExpiryDuration sets the idle-worker expiry. For PoolWithID it applies
+// only to idle owners; use WithRunningTaskTimeout for running-task escape.
 func WithExpiryDuration(expiryDuration time.Duration) Option {
 	return func(opts *Options) {
 		opts.ExpiryDuration = expiryDuration
+	}
+}
+
+// WithRunningTaskTimeout sets the PoolWithID threshold for replacing an owner
+// whose task remains running. Zero selects DefaultRunningTaskTimeout. A
+// negative value makes NewPoolWithID return
+// ErrInvalidPoolWithIDRunningTaskTimeout. This option has no effect on other
+// pool types.
+func WithRunningTaskTimeout(timeout time.Duration) Option {
+	return func(opts *Options) {
+		opts.RunningTaskTimeout = timeout
 	}
 }
 
@@ -172,11 +195,30 @@ func WithDisablePurge(disable bool) Option {
 }
 
 // WithDisablePurgeRunning controls whether PoolWithID replaces an owner whose
-// running task reaches ExpiryDuration. Setting disable to true turns off that
-// automatic recovery behavior.
+// running task reaches RunningTaskTimeout. Setting disable to true turns off
+// that automatic recovery behavior.
 func WithDisablePurgeRunning(disable bool) Option {
 	return func(opts *Options) {
 		opts.DisablePurgeRunning = disable
+	}
+}
+
+// WithMaxEscapedWorkers sets the global PoolWithID escape budget. Zero selects
+// the capacity-dependent default, while a positive value remains fixed across
+// Tune calls. A negative value makes NewPoolWithID return
+// ErrInvalidPoolWithIDEscapeBudget.
+func WithMaxEscapedWorkers(limit int) Option {
+	return func(opts *Options) {
+		opts.MaxEscapedWorkers = limit
+	}
+}
+
+// WithMaxEscapedWorkersPerID sets the PoolWithID escape budget for one ID.
+// Zero selects the default of one. A negative value makes NewPoolWithID return
+// ErrInvalidPoolWithIDEscapeBudget.
+func WithMaxEscapedWorkersPerID(limit int) Option {
+	return func(opts *Options) {
+		opts.MaxEscapedWorkersPerID = limit
 	}
 }
 

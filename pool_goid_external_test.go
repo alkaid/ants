@@ -33,6 +33,9 @@ func poolWithIDUnkeyedOptions() ants.Options {
 		true,
 		4,
 		false,
+		time.Minute,
+		2,
+		1,
 	})
 }
 
@@ -93,7 +96,17 @@ func TestPoolWithIDPublicAPI(t *testing.T) {
 		Total:         0,
 		ByID:          map[int]int{},
 		DroppedEvents: 0,
+		GlobalBudget:  1,
+		PerIDBudget:   1,
+		ExhaustedByID: map[int]ants.PoolWithIDEscapeBudgetReason{},
 	}, snapshot)
+	require.Zero(t, pool.Escaped())
+	require.Equal(t, pool.Running(), pool.TotalWorkers())
+	require.Zero(t, pool.DroppedEscapeEvents())
+	require.Equal(t, ants.PoolWithIDEscapeBudgetStatus{
+		GlobalLimit: 1,
+		PerIDLimit:  1,
+	}, pool.EscapeBudgetStatus(1))
 
 	require.NoError(t, pool.ReleaseTimeout(time.Second))
 	require.ErrorIs(t, pool.ReleaseTimeout(time.Second), ants.ErrPoolClosed)
@@ -104,13 +117,16 @@ func TestPoolWithIDPublicAPI(t *testing.T) {
 
 func TestPoolWithIDOptionsCompatibility(t *testing.T) {
 	keyed := ants.Options{
-		ExpiryDuration:      time.Second,
-		PreAlloc:            true,
-		MaxBlockingTasks:    1,
-		Nonblocking:         true,
-		DisablePurge:        true,
-		TaskBuffer:          4,
-		DisablePurgeRunning: false,
+		ExpiryDuration:         time.Second,
+		PreAlloc:               true,
+		MaxBlockingTasks:       1,
+		Nonblocking:            true,
+		DisablePurge:           true,
+		TaskBuffer:             4,
+		DisablePurgeRunning:    false,
+		RunningTaskTimeout:     time.Minute,
+		MaxEscapedWorkers:      2,
+		MaxEscapedWorkersPerID: 1,
 	}
 
 	cases := []struct {

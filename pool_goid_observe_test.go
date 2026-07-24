@@ -81,7 +81,18 @@ func poolWithIDObserveAssertNoSignal[T any](t *testing.T, ch <-chan T, label str
 	}
 }
 
-func poolWithIDObserveEntryState(t *testing.T, p *PoolWithID, id int) (*workerIDEntry, *goWorkerWithID, int64) {
+func poolWithIDObserveEventually(t *testing.T, label string, condition func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(poolWithIDObserveTestTimeout)
+	for !condition() {
+		if time.Now().After(deadline) {
+			t.Fatalf("timed out waiting for %s", label)
+		}
+		runtime.Gosched()
+	}
+}
+
+func poolWithIDObserveEntryState(t *testing.T, p *PoolWithID, id int) (*workerIDEntry, *goWorkerWithID, time.Time) {
 	t.Helper()
 	p.lock.Lock()
 	entry := p.registry.items[id]
@@ -167,10 +178,10 @@ func TestPoolWithIDOwnerRemainsSerialBeforeTimeout(t *testing.T) {
 	}
 
 	_, _, startedAt := poolWithIDObserveEntryState(t, p, id)
-	if startedAt == 0 {
+	if startedAt.IsZero() {
 		t.Fatal("task A has no recorded start time")
 	}
-	p.purgeExpired(startedAt + int64(p.options.ExpiryDuration) - 1)
+	p.purgeExpired(startedAt.Add(p.options.RunningTaskTimeout - time.Nanosecond))
 
 	poolWithIDObserveAssertNoSignal(t, bStarted, "task B start before timeout")
 	poolWithIDObserveAssertNoSignal(t, p.EscapeEvents(), "escape event before timeout")
@@ -232,12 +243,12 @@ func TestPoolWithIDTaskCompletionWinsTimeoutRace(t *testing.T) {
 	entry, owner, startedAt := poolWithIDObserveEntryState(t, p, id)
 	close(releaseA)
 	poolWithIDObserveReceive(t, taskStateCleared, "task A state clear")
-	p.purgeExpired(startedAt + int64(p.options.ExpiryDuration))
+	p.purgeExpired(startedAt.Add(p.options.RunningTaskTimeout))
 
 	poolWithIDObserveAssertNoSignal(t, p.EscapeEvents(), "escape after completed task")
 	currentEntry, currentOwner, currentStartedAt := poolWithIDObserveEntryState(t, p, id)
-	if currentEntry != entry || currentOwner != owner || currentStartedAt != 0 {
-		t.Fatalf("completion-first scan changed owner state: entry=%p owner=%p started=%d", currentEntry, currentOwner, currentStartedAt)
+	if currentEntry != entry || currentOwner != owner || !currentStartedAt.IsZero() {
+		t.Fatalf("completion-first scan changed owner state: entry=%p owner=%p started=%v", currentEntry, currentOwner, currentStartedAt)
 	}
 
 	close(allowOwnerLoop)
@@ -302,11 +313,11 @@ func TestPoolWithIDTimeoutTakeoverAndLateOwnerExit(t *testing.T) {
 				t.Fatalf("submit task B: %v", err)
 			}
 			entry, oldOwner, startedAt := poolWithIDObserveEntryState(t, p, id)
-			if startedAt == 0 {
+			if startedAt.IsZero() {
 				t.Fatal("task A has no recorded start time")
 			}
 
-			p.purgeExpired(startedAt + int64(p.options.ExpiryDuration))
+			p.purgeExpired(startedAt.Add(p.options.RunningTaskTimeout))
 			startEvent := poolWithIDObserveReceive(t, p.EscapeEvents(), "worker escape event")
 			poolWithIDObserveAssertEvent(t, startEvent, PoolWithIDWorkerEscaped, id, 1, 1)
 			if snapshot := poolWithIDObserveReceive(t, replacementSnapshot, "replacement owner escape snapshot"); snapshot.Total != 1 || snapshot.ByID[id] != 1 {
@@ -400,7 +411,7 @@ func TestPoolWithIDEscapeSnapshotWaitsForTransition(t *testing.T) {
 		<-allowTransition
 	}
 	go func() {
-		p.purgeExpired(startedAt + int64(p.options.ExpiryDuration))
+		p.purgeExpired(startedAt.Add(p.options.RunningTaskTimeout))
 		close(purgeDone)
 	}()
 	poolWithIDObserveReceive(t, transitionPaused, "escape transition pause")
@@ -473,7 +484,7 @@ func TestPoolWithIDEscapedGoexitOnlyUpdatesEscapeState(t *testing.T) {
 			}
 
 			_, _, startedAt := poolWithIDObserveEntryState(t, p, id)
-			p.purgeExpired(startedAt + int64(p.options.ExpiryDuration))
+			p.purgeExpired(startedAt.Add(p.options.RunningTaskTimeout))
 			startEvent := poolWithIDObserveReceive(t, p.EscapeEvents(), "escape start event")
 			poolWithIDObserveReceive(t, bFinished, "replacement task B")
 			if startEvent.Type != PoolWithIDWorkerEscaped || startEvent.Total != 1 || startEvent.ByID != 1 {
@@ -506,7 +517,10 @@ func TestPoolWithIDEscapedGoexitOnlyUpdatesEscapeState(t *testing.T) {
 
 func TestPoolWithIDConsecutiveEscapesEventsSnapshotAndRelease(t *testing.T) {
 	const id = 43
-	p := poolWithIDObserveNewPool(t, 1)
+	p := poolWithIDObserveNewPool(t, 1,
+		WithMaxEscapedWorkers(2),
+		WithMaxEscapedWorkersPerID(2),
+	)
 
 	releaseA := make(chan struct{})
 	releaseB := make(chan struct{})
@@ -540,16 +554,16 @@ func TestPoolWithIDConsecutiveEscapesEventsSnapshotAndRelease(t *testing.T) {
 	}
 
 	_, _, startedAtA := poolWithIDObserveEntryState(t, p, id)
-	p.purgeExpired(startedAtA + int64(p.options.ExpiryDuration))
+	p.purgeExpired(startedAtA.Add(p.options.RunningTaskTimeout))
 	first := poolWithIDObserveReceive(t, p.EscapeEvents(), "first escape event")
 	poolWithIDObserveAssertEvent(t, first, PoolWithIDWorkerEscaped, id, 1, 1)
 	poolWithIDObserveReceive(t, bStarted, "task B start")
 
 	_, _, startedAtB := poolWithIDObserveEntryState(t, p, id)
-	if startedAtB == 0 {
+	if startedAtB.IsZero() {
 		t.Fatal("task B has no recorded start time")
 	}
-	p.purgeExpired(startedAtB + int64(p.options.ExpiryDuration))
+	p.purgeExpired(startedAtB.Add(p.options.RunningTaskTimeout))
 	second := poolWithIDObserveReceive(t, p.EscapeEvents(), "second escape event")
 	poolWithIDObserveAssertEvent(t, second, PoolWithIDWorkerEscaped, id, 2, 2)
 	poolWithIDObserveReceive(t, cFinished, "second replacement owner running task C")
@@ -587,7 +601,7 @@ func TestPoolWithIDConsecutiveEscapesEventsSnapshotAndRelease(t *testing.T) {
 	}
 }
 
-func TestPoolWithIDFullEscapeEventChannelDropsWithoutBlocking(t *testing.T) {
+func TestPoolWithIDFullEscapeEventChannelDropsWithoutBlockingOrLogging(t *testing.T) {
 	const id = 44
 	logger := &poolWithIDObserveTestLogger{events: make(chan string, 4)}
 	p := poolWithIDObserveNewPool(t, 1, WithLogger(logger))
@@ -615,11 +629,9 @@ func TestPoolWithIDFullEscapeEventChannelDropsWithoutBlocking(t *testing.T) {
 	}
 
 	_, _, startedAt := poolWithIDObserveEntryState(t, p, id)
-	p.purgeExpired(startedAt + int64(p.options.ExpiryDuration))
+	p.purgeExpired(startedAt.Add(p.options.RunningTaskTimeout))
 	poolWithIDObserveReceive(t, bFinished, "replacement owner running task B")
-	if event := poolWithIDObserveReceive(t, logger.events, "escape log"); event != "worker_escaped" {
-		t.Fatalf("unexpected escape log event %q", event)
-	}
+	poolWithIDObserveAssertNoSignal(t, logger.events, "synchronous escape log")
 	snapshot := p.EscapeSnapshot()
 	if snapshot.Total != 1 || snapshot.ByID[id] != 1 || snapshot.DroppedEvents != 1 {
 		t.Fatalf("full event channel lost authoritative escape state: %+v", snapshot)
@@ -627,9 +639,10 @@ func TestPoolWithIDFullEscapeEventChannelDropsWithoutBlocking(t *testing.T) {
 
 	close(releaseA)
 	poolWithIDObserveReceive(t, aReturned, "task A return")
-	if event := poolWithIDObserveReceive(t, logger.events, "escaped worker exit log"); event != "escaped_worker_exited" {
-		t.Fatalf("unexpected exit log event %q", event)
-	}
+	poolWithIDObserveEventually(t, "escaped worker exit accounting", func() bool {
+		return p.Escaped() == 0 && p.DroppedEscapeEvents() == 2
+	})
+	poolWithIDObserveAssertNoSignal(t, logger.events, "synchronous escaped-worker exit log")
 	snapshot = p.EscapeSnapshot()
 	if snapshot.Total != 0 || len(snapshot.ByID) != 0 || snapshot.DroppedEvents != 2 {
 		t.Fatalf("full event channel blocked or corrupted worker exit: %+v", snapshot)
@@ -643,7 +656,7 @@ func TestPoolWithIDEscapeBatchPublishesStartsBeforeConcurrentExit(t *testing.T) 
 		idB = 50
 		idC = 51
 	)
-	p := poolWithIDObserveNewPool(t, 3)
+	p := poolWithIDObserveNewPool(t, 3, WithMaxEscapedWorkers(3))
 
 	releaseA := make(chan struct{})
 	releaseB := make(chan struct{})
@@ -672,7 +685,7 @@ func TestPoolWithIDEscapeBatchPublishesStartsBeforeConcurrentExit(t *testing.T) 
 	}
 	poolWithIDObserveReceive(t, aStarted, "task A start")
 	_, _, startedAtA := poolWithIDObserveEntryState(t, p, idA)
-	p.purgeExpired(startedAtA + int64(p.options.ExpiryDuration))
+	p.purgeExpired(startedAtA.Add(p.options.RunningTaskTimeout))
 	firstEscape := poolWithIDObserveReceive(t, p.EscapeEvents(), "task A escape event")
 	poolWithIDObserveAssertEvent(t, firstEscape, PoolWithIDWorkerEscaped, idA, 1, 1)
 
@@ -695,10 +708,10 @@ func TestPoolWithIDEscapeBatchPublishesStartsBeforeConcurrentExit(t *testing.T) 
 	_, _, startedAtB := poolWithIDObserveEntryState(t, p, idB)
 	_, _, startedAtC := poolWithIDObserveEntryState(t, p, idC)
 	batchNow := startedAtB
-	if startedAtC > batchNow {
+	if startedAtC.After(batchNow) {
 		batchNow = startedAtC
 	}
-	batchNow += int64(p.options.ExpiryDuration)
+	batchNow = batchNow.Add(p.options.RunningTaskTimeout)
 
 	batchRecorded := make(chan struct{})
 	p.testHooks.afterEscapeTransitionsRecorded = func() {
@@ -792,7 +805,7 @@ func TestPoolWithIDDisablePurgeOptionsPreventAutomaticEscape(t *testing.T) {
 			}
 
 			entry, owner, startedAt := poolWithIDObserveEntryState(t, p, id)
-			p.purgeExpired(startedAt + int64(p.options.ExpiryDuration))
+			p.purgeExpired(startedAt.Add(p.options.RunningTaskTimeout))
 			poolWithIDObserveAssertNoSignal(t, bStarted, "task B start while task A is blocked")
 			poolWithIDObserveAssertNoSignal(t, p.EscapeEvents(), "disabled escape event")
 			currentEntry, currentOwner, _ := poolWithIDObserveEntryState(t, p, id)
@@ -843,7 +856,7 @@ func TestPoolWithIDEscapedWorkerLateReturnAcrossReboot(t *testing.T) {
 	}
 	oldEntry, oldOwner, startedAt := poolWithIDObserveEntryState(t, p, id)
 	events := p.EscapeEvents()
-	p.purgeExpired(startedAt + int64(p.options.ExpiryDuration))
+	p.purgeExpired(startedAt.Add(p.options.RunningTaskTimeout))
 	startEvent := poolWithIDObserveReceive(t, events, "pre-Reboot escape event")
 	poolWithIDObserveAssertEvent(t, startEvent, PoolWithIDWorkerEscaped, id, 1, 1)
 	poolWithIDObserveReceive(t, bFinished, "pre-Reboot replacement task B")
@@ -925,7 +938,7 @@ func TestPoolWithIDReleaseEscapesAcceptedRunningTaskWhileClosing(t *testing.T) {
 	}
 
 	_, _, startedAt := poolWithIDObserveEntryState(t, p, id)
-	if startedAt == 0 {
+	if startedAt.IsZero() {
 		t.Fatal("accepted task A has no recorded start time")
 	}
 	stop := p.submitStop
@@ -934,7 +947,7 @@ func TestPoolWithIDReleaseEscapesAcceptedRunningTaskWhileClosing(t *testing.T) {
 	go func() {
 		<-stop
 		closingState <- atomic.LoadInt32(&p.state)
-		p.purgeExpired(startedAt + int64(p.options.ExpiryDuration))
+		p.purgeExpired(startedAt.Add(p.options.RunningTaskTimeout))
 		close(purged)
 	}()
 

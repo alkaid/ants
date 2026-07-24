@@ -356,7 +356,7 @@ func TestPoolWithIDTuneDownRetiresDrainedTimeoutReplacement(t *testing.T) {
 	_, _, firstStartedAt := poolWithIDObserveEntryState(t, p, 1)
 	_, _, secondStartedAt := poolWithIDObserveEntryState(t, p, 2)
 	latestStartedAt := firstStartedAt
-	if secondStartedAt > latestStartedAt {
+	if secondStartedAt.After(latestStartedAt) {
 		latestStartedAt = secondStartedAt
 	}
 
@@ -364,7 +364,7 @@ func TestPoolWithIDTuneDownRetiresDrainedTimeoutReplacement(t *testing.T) {
 	if got := p.Running(); got != 2 {
 		t.Fatalf("Running after Tune with running owners = %d, want 2", got)
 	}
-	p.purgeExpired(latestStartedAt + int64(p.options.ExpiryDuration))
+	p.purgeExpired(latestStartedAt.Add(p.options.RunningTaskTimeout))
 	waitForTuneCondition(t, func() bool { return p.Running() == 1 })
 
 	p.lock.Lock()

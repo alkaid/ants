@@ -2,6 +2,7 @@ package ants
 
 import (
 	"sync"
+	"time"
 
 	syncx "github.com/alkaid/ants/v2/pkg/sync"
 )
@@ -26,10 +27,11 @@ func newWorkerIDRegistry() *workerIDRegistry {
 type workerIDEntry struct {
 	mu sync.Mutex
 
-	registry *workerIDRegistry
-	id       int
-	tasks    chan func()
-	owner    *goWorkerWithID
+	registry   *workerIDRegistry
+	id         int
+	generation uint64
+	tasks      chan func()
+	owner      *goWorkerWithID
 
 	// pendingSubmits counts callers that registered while the pool was open but
 	// have not yet completed their channel send attempt. outstanding counts
@@ -38,8 +40,8 @@ type workerIDEntry struct {
 	pendingSubmits int
 	outstanding    int
 
-	taskStartedAt int64
-	lastIdleAt    int64
+	taskStartedAt time.Time
+	lastIdleAt    time.Time
 	expiryPending bool
 
 	expiryPrev *workerIDEntry
@@ -63,11 +65,13 @@ type workerIDEntryList struct {
 func newWorkerIDEntry(
 	registry *workerIDRegistry,
 	id, taskCapacity int,
-	now int64,
+	generation uint64,
+	now time.Time,
 ) *workerIDEntry {
 	return &workerIDEntry{
 		registry:   registry,
 		id:         id,
+		generation: generation,
 		tasks:      make(chan func(), taskCapacity),
 		lastIdleAt: now,
 	}
@@ -75,7 +79,7 @@ func newWorkerIDEntry(
 
 func (e *workerIDEntry) drained() bool {
 	return e.pendingSubmits == 0 && e.outstanding == 0 &&
-		e.taskStartedAt == 0 && !e.expiryPending
+		e.taskStartedAt.IsZero() && !e.expiryPending
 }
 
 // removeExpiry requires expiryMu.
