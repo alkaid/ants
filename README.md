@@ -1,19 +1,16 @@
 <p align="center">
 <img src="https://raw.githubusercontent.com/panjf2000/logos/master/ants/logo.png" />
 <b>A goroutine pool for Go</b>
-<br/><br/>
-<a title="Build Status" target="_blank" href="https://github.com/panjf2000/ants/actions?query=workflow%3ATests"><img src="https://img.shields.io/github/actions/workflow/status/panjf2000/ants/test.yml?branch=master&style=flat-square&logo=github-actions" /></a>
-<a title="Codecov" target="_blank" href="https://codecov.io/gh/panjf2000/ants"><img src="https://img.shields.io/codecov/c/github/panjf2000/ants?style=flat-square&logo=codecov" /></a>
-<a title="Release" target="_blank" href="https://github.com/panjf2000/ants/releases"><img src="https://img.shields.io/github/v/release/panjf2000/ants.svg?color=161823&style=flat-square&logo=smartthings" /></a>
-<a title="Tag" target="_blank" href="https://github.com/panjf2000/ants/tags"><img src="https://img.shields.io/github/v/tag/panjf2000/ants?color=%23ff8936&logo=fitbit&style=flat-square" /></a>
-<br/>
-<a title="Minimum Go Version" target="_blank" href="https://github.com/panjf2000/gnet"><img src="https://img.shields.io/badge/go-%3E%3D1.26.5-30dff3?style=flat-square&logo=go" /></a>
-<a title="Go Report Card" target="_blank" href="https://goreportcard.com/report/github.com/panjf2000/ants"><img src="https://goreportcard.com/badge/github.com/panjf2000/ants?style=flat-square" /></a>
-<a title="Doc for ants" target="_blank" href="https://pkg.go.dev/github.com/alkaid/ants/v2?tab=doc"><img src="https://img.shields.io/badge/go.dev-doc-007d9c?style=flat-square&logo=read-the-docs" /></a>
-<a title="Mentioned in Awesome Go" target="_blank" href="https://github.com/avelino/awesome-go#goroutines"><img src="https://awesome.re/mentioned-badge-flat.svg" /></a>
 </p>
 
 English | [中文](README_ZH.md)
+
+> [!IMPORTANT]
+> This repository is an internal mirror of
+> [`panjf2000/ants`](https://github.com/panjf2000/ants). It keeps the `/v2`
+> module path under `github.com/alkaid/ants/v2` and adds the fork-specific
+> `PoolWithID` API. Upstream CI, coverage, tags, and releases do not describe
+> this mirror. This mirror supports Go 1.19 and later.
 
 ## 📖 Introduction
 
@@ -55,20 +52,29 @@ Library `ants` implements a goroutine pool with fixed capacity, managing and rec
 go get -u github.com/panjf2000/ants
 ```
 
-### For `ants` v2 (with GO111MODULE=on)
+### For the internal `ants` v2 mirror
 
 ```powershell
-go get -u github.com/alkaid/ants/v2
+go get github.com/alkaid/ants/v2@INTERNAL_VERSION
 ```
 
+Replace `INTERNAL_VERSION` with the exact version or commit exposed by the
+organization-approved internal Git service or module proxy. The
+`v2.12.1-ak-3` delivery in this checkout is a local lightweight tag: it is not
+pushed and cannot be resolved through the public Go module proxy. The internal
+mirror requires Go 1.19 or later.
+
 ## 🛠 How to use
-Check out [the examples](https://pkg.go.dev/github.com/alkaid/ants/v2#pkg-examples) for basic usage.
+Read the local [examples](pool_goid_example_test.go) or run
+`go doc github.com/alkaid/ants/v2` against the approved internal version.
 
 ### Functional options for pool
 
-`ants.Options`contains all optional configurations of the ants pool, which allows you to customize the goroutine pool by invoking option functions to set up each configuration in `NewPool`/`NewPoolWithFunc`/`NewPoolWithFuncGeneric` method.
+`ants.Options` contains the optional pool settings. Pass option functions when
+calling `NewPool`, `NewPoolWithFunc`, or `NewPoolWithFuncGeneric` to customize
+them.
 
-Check out [ants.Options](https://pkg.go.dev/github.com/alkaid/ants/v2#Options) and [ants.Option](https://pkg.go.dev/github.com/alkaid/ants/v2#Option) for more details.
+See [`ants.Options` and `ants.Option`](options.go) for more details.
 
 ### Customize pool capacity
 
@@ -124,63 +130,83 @@ pool.Reboot()
 
 ### `PoolWithID` contract
 
-`NewPoolWithID(size, ...Option)` uses the same public `Option` type as the
-other constructors. Direct options, expanded `[]Option` slices, and
-`WithOptions` remain supported. This fork adds `TaskBuffer` and
-`DisablePurgeRunning` to `Options`, so it does not promise compatibility with
-unkeyed `Options` literals written for the upstream field count. Use option
-functions or keyed literals. `WithPreAlloc(true)` is accepted by `PoolWithID`
-but intentionally has no effect: ID workers are neither preallocated nor
+`PoolWithID` is an extension in this internal fork. It uses the same public
+`Option` type as the other constructors, including direct `Option` values,
+expanded `[]Option` slices, and `WithOptions`. The fork extends the shared
+`Options` struct with `TaskBuffer`, `DisablePurgeRunning`,
+`RunningTaskTimeout`, `MaxEscapedWorkers`, and `MaxEscapedWorkersPerID`.
+Upstream unkeyed `Options` literals are therefore source-incompatible. Use
+option functions or keyed literals. `WithPreAlloc(true)` is accepted but has no
+effect because ID workers and their queues are allocated on demand and are not
 reused.
 
-For each ID, successful non-concurrent submissions start in FIFO order and run
-serially during normal operation. Concurrent calls to `Submit` have no defined
-order. `ExpiryDuration` is measured from the start of task execution, not from
-`Submit`. When a running task reaches it, the old owner escapes and a replacement
-owner can run later tasks for the same ID. This restores scheduling but allows
-the old and new tasks to overlap; Go cannot forcibly stop the old task, which
-may retain resources or produce late side effects. Timeout recovery does not
-guarantee completion order.
+The important defaults and limits are:
 
-`TaskBuffer` is the per-ID admission limit, not the channel capacity. A positive
-value `N` creates a physical channel of `2*N`; zero selects the default limit 10
-and capacity 20. Negative values and values that overflow when doubled make the
-constructor return `ErrInvalidPoolWithIDTaskBuffer`.
+| Setting | Zero value | Positive value and limits |
+|---|---|---|
+| `ExpiryDuration` | 30 seconds | Controls idle-owner expiry only. |
+| `RunningTaskTimeout` | 5 minutes | Controls running-task escape independently of idle expiry. Negative values are rejected. |
+| `TaskBuffer` | `DefaultTaskBuffer=100` | Per-ID admission limit from 1 through `MaxTaskBuffer=64*1024`; the physical channel has `2*TaskBuffer` slots. |
+| `MaxEscapedWorkers` | Finite pools use `min(64, max(1, Cap()/4))`; infinite pools use 64. | A positive limit stays fixed across `Tune` calls. Negative values are rejected. |
+| `MaxEscapedWorkersPerID` | 1 | Sets a fixed per-ID limit. Negative values are rejected. |
+| `MaxBlockingTasks` | 0 means unlimited. | Limits all currently blocked `PoolWithID.Submit` calls. |
+
+`MinTaskBuffer=10` remains exported only for source compatibility and is
+deprecated. It is not the default. `MaxTaskBuffer` bounds one ID's queue, not
+the sum of all active ID queues. See the
+[migration guide](docs/pool-with-id-migration.md) before choosing a large
+buffer.
+
+For one ID, successful non-concurrent submissions start in FIFO order and run
+serially on the normal path. Concurrent `Submit` calls have no defined order.
+`RunningTaskTimeout` starts when a task begins execution. When the timeout is
+reached and both escape budgets have room, the managed owner escapes and a
+replacement may run later tasks for that ID. The scheduler checks running
+owners at intervals no longer than 30 seconds, so the transition can occur
+after the configured threshold. Go cannot stop the escaped task. It may overlap
+the replacement, keep resources alive, and produce late side effects.
 
 | Submission path | Behavior |
 |---|---|
-| New ID, no owner capacity, `Nonblocking=true` | Returns `ErrPoolOverload` immediately. |
-| Existing ID, `Nonblocking=true` | Rejects when the observed queue length reaches `TaskBuffer`; a final nonblocking send also rejects if the physical channel is full. |
-| New ID, `Nonblocking=false` | Waits for owner capacity and is subject to `MaxBlockingTasks`. |
-| Existing ID, `Nonblocking=false` | May use the full `2*TaskBuffer` channel, then waits for queue space or pool closure. `MaxBlockingTasks` does not limit this wait. |
+| New ID, `Nonblocking=true` | Returns `ErrPoolOverload` if owner capacity is unavailable or another caller is allocating that ID. |
+| Existing ID, `Nonblocking=true` | Rejects when the observed queue length reaches `TaskBuffer`; the final nonblocking send also rejects if the physical channel is full. |
+| New ID, `Nonblocking=false` | Waits for owner capacity or an in-progress allocation, subject to `MaxBlockingTasks`. |
+| Existing ID, `Nonblocking=false` | May use the full `2*TaskBuffer` channel, then waits for queue space or pool closure, also subject to `MaxBlockingTasks`. |
 
-The nonblocking admission check and send are not serialized. Concurrent callers
-may therefore enter the reserved half between `TaskBuffer` and `2*TaskBuffer`;
-the bounded channel and final nonblocking send are what guarantee that `Submit`
-does not wait. A task that uses blocking mode to recursively submit to its own
-full ID queue is not guaranteed to make progress.
+`Waiting()` counts only submissions that are currently blocked across those
+wait paths. A call moving directly from one wait path to another keeps one
+waiter slot and is never counted twice. The nonblocking admission check and
+send are not serialized, so concurrent calls may use the reserved half between
+`TaskBuffer` and `2*TaskBuffer`. A task that recursively submits to its own full
+ID queue in blocking mode is not guaranteed to make progress.
 
-`WithDisablePurgeRunning(true)` prevents a long-running owner from escaping.
-`WithDisablePurge(true)` stops the purge loop and therefore disables this
-recovery as well. Either option lets a permanently blocked task block its ID
-indefinitely.
+`WithDisablePurgeRunning(true)` disables running-task escape while preserving
+idle expiry. `WithDisablePurge(true)` disables both idle expiry and running-task
+escape. Either setting can let a permanently blocked task block its ID forever.
 
-`Release` stops admission and starts draining accepted tasks; use
-`ReleaseTimeout` or `ReleaseContext` to wait for the managed drain. Escaped
-workers are not included in that wait, so `CLOSED` does not mean every task
-goroutine has exited. `Reboot` waits for the managed drain, opens an empty ID
-registry, and also does not wait for escaped workers. An old escaped task cannot
-change the new scheduler state, but it may overlap same-ID work after reboot and
-still produce late side effects.
+`Release()` stops admission and starts the managed drain without waiting.
+`ReleaseContext` and `ReleaseTimeout` wait for the current generation's
+admission work, accepted queues, managed owners, and background loop. They do
+not wait for escaped workers. A task accepted before closing may still escape
+while the pool is draining; after a successful managed close, that generation
+cannot start another escape transition. `Reboot()` waits for the managed close,
+opens an empty registry, and does not wait for escaped workers. Escape permits,
+counts, dropped-event totals, and the event stream remain continuous across
+`Release` and `Reboot`.
 
-`EscapeEvents` is a best-effort notification channel with a fixed capacity of
-64. Publishing never blocks; full-channel notifications are counted in
-`EscapeSnapshot().DroppedEvents`. The channel has one direct application
-consumer, remains open across `Release` and `Reboot`, and must be stopped with an
-application-owned context. `EscapeSnapshot` is the authoritative current state.
-`Running()+EscapeSnapshot().Total` estimates the pool's live worker goroutines.
-Do not automatically retry a task because it escaped: the old task can still
-complete and duplicate side effects.
+`EscapeEvents()` is a best-effort channel with capacity 64. It reports worker
+escape, escaped-worker exit, and budget exhaustion with generation and budget
+fields. Publishing never blocks; `DroppedEscapeEvents()` and
+`EscapeSnapshot().DroppedEvents` report full-channel drops. Use one direct
+consumer and an application-owned context, then reconcile periodically with
+the authoritative `EscapeSnapshot()`. Snapshot maps are caller-owned copies;
+the full snapshot is O(K) in the number of observed IDs.
+
+`Escaped()`, `TotalWorkers()`, `EscapeBudgetStatus(id)`, and
+`DroppedEscapeEvents()` provide O(1) totals for frequent monitoring.
+`Running()` and `Free()` count managed owners only; `TotalWorkers()` is
+`Running()+Escaped()`. An escape event must not trigger an automatic retry
+because the original task can still complete and duplicate side effects.
 
 The following external-package example is compiled as part of the test suite.
 It keeps per-ID state out of metric labels and exports only a low-cardinality
@@ -216,8 +242,9 @@ func MonitorPoolWithID(
 			} else {
 				knownIDs[event.ID] = struct{}{}
 			}
-			log.Printf("pool escape type=%d id=%d by_id=%d total=%d",
-				event.Type, event.ID, event.ByID, event.Total)
+			log.Printf("pool escape type=%d id=%d generation=%d reason=%d by_id=%d total=%d",
+				event.Type, event.ID, event.Generation, event.BudgetReason,
+				event.ByID, event.Total)
 		case <-ticker.C:
 			// Events notify promptly; the snapshot repairs missed notifications.
 			snapshot := pool.EscapeSnapshot()

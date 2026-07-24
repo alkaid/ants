@@ -1,19 +1,15 @@
 <p align="center">
 <img src="https://raw.githubusercontent.com/panjf2000/logos/master/ants/logo.png" />
 <b>Go 语言的 goroutine 池</b>
-<br/><br/>
-<a title="Build Status" target="_blank" href="https://github.com/panjf2000/ants/actions?query=workflow%3ATests"><img src="https://img.shields.io/github/actions/workflow/status/panjf2000/ants/test.yml?branch=master&style=flat-square&logo=github-actions" /></a>
-<a title="Codecov" target="_blank" href="https://codecov.io/gh/panjf2000/ants"><img src="https://img.shields.io/codecov/c/github/panjf2000/ants?style=flat-square&logo=codecov" /></a>
-<a title="Release" target="_blank" href="https://github.com/panjf2000/ants/releases"><img src="https://img.shields.io/github/v/release/panjf2000/ants.svg?color=161823&style=flat-square&logo=smartthings" /></a>
-<a title="Tag" target="_blank" href="https://github.com/panjf2000/ants/tags"><img src="https://img.shields.io/github/v/tag/panjf2000/ants?color=%23ff8936&logo=fitbit&style=flat-square" /></a>
-<br/>
-<a title="Minimum Go Version" target="_blank" href="https://github.com/panjf2000/gnet"><img src="https://img.shields.io/badge/go-%3E%3D1.26.5-30dff3?style=flat-square&logo=go" /></a>
-<a title="Go Report Card" target="_blank" href="https://goreportcard.com/report/github.com/panjf2000/ants"><img src="https://goreportcard.com/badge/github.com/panjf2000/ants?style=flat-square" /></a>
-<a title="Doc for ants" target="_blank" href="https://pkg.go.dev/github.com/alkaid/ants/v2?tab=doc"><img src="https://img.shields.io/badge/go.dev-doc-007d9c?style=flat-square&logo=read-the-docs" /></a>
-<a title="Mentioned in Awesome Go" target="_blank" href="https://github.com/avelino/awesome-go#goroutines"><img src="https://awesome.re/mentioned-badge-flat.svg" /></a>
 </p>
 
 [英文](README.md) | 中文
+
+> [!IMPORTANT]
+> 本仓库是 [`panjf2000/ants`](https://github.com/panjf2000/ants) 的内部镜像，
+> 使用 `github.com/alkaid/ants/v2` module path，并增加了 fork 专用的
+> `PoolWithID` API。上游 CI、覆盖率、tag 和 release 状态不代表本镜像状态。
+> 本镜像支持 Go 1.19 及以上版本。
 
 ## 📖 简介
 
@@ -55,21 +51,27 @@
 go get -u github.com/panjf2000/ants
 ```
 
-### 使用 `ants` v2 版本 (开启 GO111MODULE=on):
+### 使用内部 `ants` v2 镜像：
 
 ```powershell
-go get -u github.com/alkaid/ants/v2
+go get github.com/alkaid/ants/v2@INTERNAL_VERSION
 ```
 
+请把 `INTERNAL_VERSION` 替换为组织批准的内部 Git 服务或 module proxy
+提供的精确版本或提交。本次交付只在当前检出中创建本地轻量 tag
+`v2.12.1-ak-3`，不会推送，也不能通过公共 Go module proxy 获取。内部镜像要求
+Go 1.19 或更高版本。
+
 ## 🛠 使用
-基本的使用请查看[示例](https://pkg.go.dev/github.com/alkaid/ants/v2#pkg-examples).
+基本用法请查看本地[示例](pool_goid_example_test.go)，或针对内部批准版本运行
+`go doc github.com/alkaid/ants/v2`。
 
 ### Pool 配置
 
-通过在调用 `NewPool`/`NewPoolWithFunc`/`NewPoolWithFuncGeneric` 之时使用各种 optional function，可以设置 `ants.Options` 中各个配置项的值，然后用它来定制化 goroutine pool。
+调用 `NewPool`、`NewPoolWithFunc` 或 `NewPoolWithFuncGeneric` 时，可以通过各个
+Option 函数设置 `ants.Options`，定制 goroutine pool。
 
-更多细节请查看 [ants.Options](https://pkg.go.dev/github.com/alkaid/ants/v2#Options) 和 [ants.Option](https://pkg.go.dev/github.com/alkaid/ants/v2#Option)
-
+更多细节请查看 [`ants.Options` 和 `ants.Option`](options.go)。
 
 ### 自定义 pool 容量
 `ants` 支持实例化使用者自己的一个 Pool，指定具体的 pool 容量；通过调用 `NewPool` 方法可以实例化一个新的带有指定容量的 `Pool`，如下：
@@ -125,51 +127,71 @@ pool.Reboot()
 
 ### `PoolWithID` 契约
 
-`NewPoolWithID(size, ...Option)` 与其他构造函数使用同一个公开 `Option`
-类型，继续支持直接传入 option、展开 `[]Option` 和 `WithOptions`。本 fork 在
-`Options` 中增加了 `TaskBuffer` 和 `DisablePurgeRunning`，因此不承诺兼容按
-上游字段数量书写的非键名 `Options` 字面量；应优先使用 option 函数或键名
-字面量。`PoolWithID` 接受 `WithPreAlloc(true)`，但该选项有意不生效：ID
-worker 不会预分配或复用。
+`PoolWithID` 是内部 fork 的扩展。它与其他构造函数使用相同的公开 `Option`
+类型，支持直接传入 `Option`、展开 `[]Option` 和 `WithOptions`。本 fork 在共享
+`Options` 中增加了 `TaskBuffer`、`DisablePurgeRunning`、
+`RunningTaskTimeout`、`MaxEscapedWorkers` 和 `MaxEscapedWorkersPerID`。
+因此，按上游字段数量书写的非键名字面量不再源码兼容。请使用 option 函数或
+键名字面量。`WithPreAlloc(true)` 可以传给 `PoolWithID`，但不会生效，因为 ID
+worker 及其队列按需分配，也不会复用。
 
-对于同一 ID，非并发且已成功返回的提交在正常路径按 FIFO 顺序开始，并保持
-串行执行；真正并发的多个 `Submit` 调用之间不定义顺序。`ExpiryDuration` 从
-任务实际开始执行时计时，而不是从 `Submit` 开始。运行任务达到该阈值后，旧
-owner 会逃逸，新 owner 可以执行该 ID 的后续任务。该机制恢复的是调度能力，
-旧任务和新任务可能重叠；Go 无法强制终止旧任务，它仍可能占用资源或产生迟到
-副作用。超时恢复路径不保证任务完成顺序。
+关键默认值和上限如下：
 
-`TaskBuffer` 是每个 ID 的接纳水位，不是 channel 容量。正值 `N` 对应物理
-channel 容量 `2*N`；零使用默认接纳水位 10 和容量 20。负数或乘 2 后溢出的
-值会让构造函数返回 `ErrInvalidPoolWithIDTaskBuffer`。
+| 配置 | 零值 | 正值与边界 |
+|---|---|---|
+| `ExpiryDuration` | 30 秒 | 只控制 idle owner 回收。 |
+| `RunningTaskTimeout` | 5 分钟 | 独立控制 running task escape。负值会被拒绝。 |
+| `TaskBuffer` | `DefaultTaskBuffer=100` | 每个 ID 的接纳水位范围是 1 到 `MaxTaskBuffer=64*1024`；物理 channel 有 `2*TaskBuffer` 个槽位。 |
+| `MaxEscapedWorkers` | 有限池使用 `min(64, max(1, Cap()/4))`，无限池使用 64。 | 显式正值不会随 `Tune` 改变。负值会被拒绝。 |
+| `MaxEscapedWorkersPerID` | 1 | 设置固定的 per-ID 上限。负值会被拒绝。 |
+| `MaxBlockingTasks` | 0 表示不限制。 | 限制当前所有阻塞中的 `PoolWithID.Submit`。 |
+
+`MinTaskBuffer=10` 只为源码兼容而保留，现已废弃，不再表示默认值。
+`MaxTaskBuffer` 只限制单个 ID 的队列，不限制所有活跃 ID 的队列总和。配置较大
+buffer 前请阅读[迁移指南](docs/pool-with-id-migration.md)。
+
+对于同一 ID，非并发且已经成功返回的提交在正常路径按 FIFO 顺序开始，并保持
+串行执行。并发 `Submit` 调用之间不定义顺序。`RunningTaskTimeout` 从任务开始
+执行时计时。达到阈值且两个 escape budget 都有剩余额度时，当前 managed
+owner 会逃逸，replacement 可以继续执行该 ID 的后续任务。调度器检查 running
+owner 的间隔不超过 30 秒，因此 transition 可能晚于配置阈值。Go 无法停止已经
+逃逸的任务；它可能与 replacement 重叠、继续占用资源或产生迟到副作用。
 
 | 提交路径 | 行为 |
 |---|---|
-| 新 ID 无 owner 容量，`Nonblocking=true` | 立即返回 `ErrPoolOverload`。 |
+| 新 ID，`Nonblocking=true` | owner 容量不足或其他调用正在分配该 ID 时，返回 `ErrPoolOverload`。 |
 | 已有 ID，`Nonblocking=true` | 观察到队列长度达到 `TaskBuffer` 时拒绝；物理 channel 已满时，最终非阻塞发送也会拒绝。 |
-| 新 ID，`Nonblocking=false` | 等待 owner 容量，并受 `MaxBlockingTasks` 限制。 |
-| 已有 ID，`Nonblocking=false` | 可以使用完整的 `2*TaskBuffer` channel，随后等待队列空间或池关闭；`MaxBlockingTasks` 不限制此等待。 |
+| 新 ID，`Nonblocking=false` | 等待 owner 容量或进行中的分配，并受 `MaxBlockingTasks` 限制。 |
+| 已有 ID，`Nonblocking=false` | 可以使用完整的 `2*TaskBuffer` channel，随后等待队列空间或 pool 关闭，同样受 `MaxBlockingTasks` 限制。 |
 
-非阻塞模式的水位检查和发送没有串行化，因此并发调用可能进入 `TaskBuffer` 到
-`2*TaskBuffer` 之间的预留区；有界 channel 和最终非阻塞发送才保证 `Submit`
-不会等待。任务在阻塞模式下向自己已满的同 ID 队列递归提交时，不保证活性。
+`Waiting()` 只统计上述路径中当前真实阻塞的提交。一次调用直接从一个等待点转入
+另一个等待点时只占一个 waiter 配额，不会重复计数。非阻塞模式的水位检查和
+发送没有串行化，因此并发调用可能进入 `TaskBuffer` 到 `2*TaskBuffer` 之间的
+预留区。任务在阻塞模式下向自己已满的同 ID 队列递归提交时，不保证活性。
 
-`WithDisablePurgeRunning(true)` 会阻止长时间运行的 owner 逃逸；
-`WithDisablePurge(true)` 会停止清理循环，因此也会关闭该恢复机制。使用任一选项
-时，永久阻塞的任务都可能永久阻塞对应 ID。
+`WithDisablePurgeRunning(true)` 关闭 running task escape，但保留 idle owner
+回收。`WithDisablePurge(true)` 同时关闭 idle owner 回收和 running task
+escape。两种配置都可能让永久阻塞的任务一直阻塞对应 ID。
 
-`Release` 停止接纳并开始排空已接受任务；需要等待受管任务排空时，应使用
-`ReleaseTimeout` 或 `ReleaseContext`。escaped worker 不属于该等待范围，因而
-`CLOSED` 不代表所有任务 goroutine 都已退出。`Reboot` 等待受管任务排空后打开
-一个空 ID 注册表，同样不等待 escaped worker。旧 escaped 任务不能修改新的
-调度状态，但可能与重启后的同 ID 任务重叠，并继续产生迟到副作用。
+`Release()` 停止接纳并启动 managed drain，不等待完成。`ReleaseContext` 和
+`ReleaseTimeout` 等待当前 generation 的 admission、已接纳队列、managed owner
+和后台循环，但不等待 escaped worker。pool 排空期间，关闭前接纳的任务仍可能
+escape；managed close 成功后，该 generation 不会再启动新的 escape
+transition。`Reboot()` 等待 managed close 后打开空 registry，同样不等待
+escaped worker。escape permit、计数、丢失事件总数和 event stream 都跨
+`Release` 与 `Reboot` 保留。
 
-`EscapeEvents` 是容量固定为 64 的尽力通知通道。发布从不阻塞；通道满时，
-丢弃数记录在 `EscapeSnapshot().DroppedEvents`。应用只应有一个直接消费者，
-通道跨 `Release` 和 `Reboot` 保持打开，消费协程应使用应用自己的 context
-退出。`EscapeSnapshot` 才是当前状态的权威来源。
-`Running()+EscapeSnapshot().Total` 可估算该池仍存活的 worker goroutine 数。
-不能因为任务逃逸就自动重试：旧任务仍可能完成并造成重复副作用。
+`EscapeEvents()` 是容量为 64 的 best-effort channel，报告 worker escape、
+escaped worker exit 和 budget exhausted，并包含 generation 与 budget 字段。
+发布不会阻塞；channel 满时的丢弃数可从 `DroppedEscapeEvents()` 和
+`EscapeSnapshot().DroppedEvents` 读取。应用应只设置一个直接消费者，使用自己
+的 context 管理退出，并定期读取权威的 `EscapeSnapshot()` 对账。snapshot 中
+的 map 是调用方持有的副本；完整 snapshot 的复杂度为 O(K)，K 是已观测 ID 数。
+
+高频监控可使用 O(1) 的 `Escaped()`、`TotalWorkers()`、
+`EscapeBudgetStatus(id)` 和 `DroppedEscapeEvents()`。`Running()` 与 `Free()`
+只统计 managed owner；`TotalWorkers()` 等于 `Running()+Escaped()`。不能因为
+收到 escape event 就自动重试任务，因为旧任务仍可能完成并造成重复副作用。
 
 下面的外部包示例会作为测试的一部分参与编译。示例不把 ID 用作指标标签，只
 导出低基数的全池 escaped 总量：
@@ -204,8 +226,9 @@ func MonitorPoolWithID(
 			} else {
 				knownIDs[event.ID] = struct{}{}
 			}
-			log.Printf("pool escape type=%d id=%d by_id=%d total=%d",
-				event.Type, event.ID, event.ByID, event.Total)
+			log.Printf("pool escape type=%d id=%d generation=%d reason=%d by_id=%d total=%d",
+				event.Type, event.ID, event.Generation, event.BudgetReason,
+				event.ByID, event.Total)
 		case <-ticker.C:
 			// 事件用于及时通知；快照用于修正丢失的通知。
 			snapshot := pool.EscapeSnapshot()

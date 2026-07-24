@@ -325,7 +325,7 @@ func TestWorkerIDRegistryPurgeVisitsRunningExpiryPrefix(t *testing.T) {
 	}
 
 	closeReleaseTasks()
-	for range total {
+	for i := 0; i < total; i++ {
 		poolWithIDReceive(t, returned)
 	}
 	poolWithIDObserveRelease(t, p)

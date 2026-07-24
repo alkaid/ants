@@ -30,8 +30,9 @@ func MonitorPoolWithID(
 			} else {
 				knownIDs[event.ID] = struct{}{}
 			}
-			log.Printf("pool escape type=%d id=%d by_id=%d total=%d",
-				event.Type, event.ID, event.ByID, event.Total)
+			log.Printf("pool escape type=%d id=%d generation=%d reason=%d by_id=%d total=%d",
+				event.Type, event.ID, event.Generation, event.BudgetReason,
+				event.ByID, event.Total)
 		case <-ticker.C:
 			// Events notify promptly; the snapshot repairs missed notifications.
 			snapshot := pool.EscapeSnapshot()
