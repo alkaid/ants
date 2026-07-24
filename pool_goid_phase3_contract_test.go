@@ -655,7 +655,7 @@ func TestPoolWithIDEscapeEventsPreserveMixedScanOrder(t *testing.T) {
 	}
 	poolWithIDPhase3Receive(t, bStarted, "B start")
 	clock.Advance(time.Hour)
-	p.purgeExpiredNow()
+	p.purgeExpiredBatched(clock.Now(), clock.Since, 1)
 
 	deniedA := poolWithIDPhase3Receive(t, p.EscapeEvents(), "A per-ID exhaustion")
 	poolWithIDPhase3AssertEvent(
@@ -664,6 +664,12 @@ func TestPoolWithIDEscapeEventsPreserveMixedScanOrder(t *testing.T) {
 	)
 	escapedB := poolWithIDPhase3Receive(t, p.EscapeEvents(), "B escape")
 	poolWithIDPhase3AssertEvent(t, escapedB, PoolWithIDWorkerEscaped, idB, 1, 2, 1, 0, 3, 1)
+	p.registry.expiryMu.Lock()
+	deferred := p.registry.deferredCount
+	p.registry.expiryMu.Unlock()
+	if deferred != 1 {
+		t.Fatalf("deferred running entries = %d, want 1", deferred)
+	}
 
 	closeA1()
 }

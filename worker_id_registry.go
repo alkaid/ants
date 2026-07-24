@@ -11,10 +11,12 @@ import (
 // PoolWithID registry lock; entry state has a narrower lock for submissions and
 // worker state transitions.
 type workerIDRegistry struct {
-	items    map[int]*workerIDEntry
-	expiryMu sync.Locker
-	idle     workerIDEntryList
-	running  workerIDEntryList
+	items         map[int]*workerIDEntry
+	expiryMu      sync.Locker
+	idle          workerIDEntryList
+	running       workerIDEntryList
+	deferred      workerIDEntryList
+	deferredCount int
 }
 
 func newWorkerIDRegistry() *workerIDRegistry {
@@ -55,6 +57,7 @@ const (
 	workerIDEntryListNone workerIDEntryListKind = iota
 	workerIDEntryListIdle
 	workerIDEntryListRunning
+	workerIDEntryListDeferred
 )
 
 type workerIDEntryList struct {
@@ -88,8 +91,12 @@ func (r *workerIDRegistry) removeExpiry(entry *workerIDEntry) {
 		return
 	}
 	list := &r.idle
-	if entry.expiryList == workerIDEntryListRunning {
+	switch entry.expiryList {
+	case workerIDEntryListRunning:
 		list = &r.running
+	case workerIDEntryListDeferred:
+		list = &r.deferred
+		r.deferredCount--
 	}
 	if entry.expiryPrev == nil {
 		list.head = entry.expiryNext
@@ -114,6 +121,12 @@ func (r *workerIDRegistry) appendIdle(entry *workerIDEntry) {
 // appendRunning requires expiryMu and the entry lock.
 func (r *workerIDRegistry) appendRunning(entry *workerIDEntry) {
 	r.appendExpiry(entry, workerIDEntryListRunning, &r.running)
+}
+
+// appendDeferred requires expiryMu and the entry lock.
+func (r *workerIDRegistry) appendDeferred(entry *workerIDEntry) {
+	r.appendExpiry(entry, workerIDEntryListDeferred, &r.deferred)
+	r.deferredCount++
 }
 
 func (r *workerIDRegistry) appendExpiry(

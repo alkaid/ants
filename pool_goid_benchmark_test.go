@@ -2,93 +2,83 @@ package ants
 
 import (
 	"errors"
+	"fmt"
 	"runtime"
-	"sort"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 )
 
-const (
-	poolWithIDBenchmarkTimeout   = 2 * time.Minute
-	poolWithIDBenchmarkMaxSample = 64 * 1024
-)
+const poolWithIDBenchmarkTimeout = 2 * time.Minute
 
-var poolWithIDBenchmarkSizes = [...]int{1_000, 10_000, 100_000}
+var poolWithIDBenchmarkDiagnosticSizes = [...]int{1_000, 10_000}
 
-var poolWithIDBenchmarkTaskKinds = [...]struct {
-	name string
-	cpu  bool
-}{
-	{name: "empty"},
-	{name: "cpu", cpu: true},
-}
-
-var poolWithIDBenchmarkSink atomic.Uint64
-
-type poolWithIDBenchmarkLock struct {
+type poolWithIDBenchmarkLockDiagnostic struct {
 	sync.Locker
 	heldAt time.Time
 	total  atomic.Int64
 }
 
-func (l *poolWithIDBenchmarkLock) Lock() {
+func (l *poolWithIDBenchmarkLockDiagnostic) Lock() {
 	l.Locker.Lock()
 	l.heldAt = time.Now()
 }
 
-func (l *poolWithIDBenchmarkLock) Unlock() {
+func (l *poolWithIDBenchmarkLockDiagnostic) Unlock() {
 	l.total.Add(time.Since(l.heldAt).Nanoseconds())
 	l.Locker.Unlock()
 }
 
-func (l *poolWithIDBenchmarkLock) reset() {
+func (l *poolWithIDBenchmarkLockDiagnostic) reset() {
 	l.total.Store(0)
 }
 
-func poolWithIDBenchmarkNew(b *testing.B, size int) (*PoolWithID, *poolWithIDBenchmarkLock) {
+func poolWithIDBenchmarkNewPool(
+	b *testing.B,
+	size int,
+	options ...Option,
+) *PoolWithID {
+	b.Helper()
+	options = append(options, WithLogger(poolWithIDDiscardLogger{}))
+	p, err := NewPoolWithID(size, options...)
+	if err != nil {
+		b.Fatalf("NewPoolWithID: %v", err)
+	}
+	return p
+}
+
+func poolWithIDBenchmarkNewMode(
+	b *testing.B,
+	size, taskBuffer int,
+	nonblocking, disablePurge bool,
+) *PoolWithID {
+	b.Helper()
+	options := []Option{
+		WithExpiryDuration(time.Hour),
+		WithRunningTaskTimeout(time.Hour),
+		WithTaskBuffer(taskBuffer),
+		WithNonblocking(nonblocking),
+	}
+	if disablePurge {
+		options = append(options, WithDisablePurge(true))
+	}
+	return poolWithIDBenchmarkNewPool(b, size, options...)
+}
+
+func poolWithIDBenchmarkNewDiagnostic(
+	b *testing.B,
+	size int,
+) (*PoolWithID, *poolWithIDBenchmarkLockDiagnostic) {
 	b.Helper()
 	taskBuffer := (1 << 20) / size
 	if taskBuffer < 16 {
 		taskBuffer = 16
 	}
-	p, err := NewPoolWithID(
-		size,
-		WithExpiryDuration(time.Hour),
-		WithTaskBuffer(taskBuffer),
-		WithNonblocking(true),
-		WithLogger(poolWithIDDiscardLogger{}),
-	)
-	if err != nil {
-		b.Fatalf("NewPoolWithID: %v", err)
-	}
-	measuredLock := &poolWithIDBenchmarkLock{Locker: p.lock}
-	p.lock = measuredLock
-	return p, measuredLock
-}
-
-func poolWithIDBenchmarkNewP3(b *testing.B, size, taskBuffer int) *PoolWithID {
-	return poolWithIDBenchmarkNewP3Mode(b, size, taskBuffer, true)
-}
-
-func poolWithIDBenchmarkNewP3Mode(
-	b *testing.B,
-	size, taskBuffer int,
-	nonblocking bool,
-) *PoolWithID {
-	b.Helper()
-	p, err := NewPoolWithID(
-		size,
-		WithExpiryDuration(time.Hour),
-		WithTaskBuffer(taskBuffer),
-		WithNonblocking(nonblocking),
-		WithLogger(poolWithIDDiscardLogger{}),
-	)
-	if err != nil {
-		b.Fatalf("NewPoolWithID: %v", err)
-	}
-	return p
+	p := poolWithIDBenchmarkNewMode(b, size, taskBuffer, true, false)
+	lock := &poolWithIDBenchmarkLockDiagnostic{Locker: p.lock}
+	p.lock = lock
+	return p, lock
 }
 
 func poolWithIDBenchmarkRelease(b *testing.B, p *PoolWithID) {
@@ -99,10 +89,31 @@ func poolWithIDBenchmarkRelease(b *testing.B, p *PoolWithID) {
 	}
 }
 
-func poolWithIDBenchmarkWaitForIdle(b *testing.B, p *PoolWithID, count int) {
+func poolWithIDBenchmarkWaitFor(
+	b *testing.B,
+	label string,
+	condition func() bool,
+) {
 	b.Helper()
 	deadline := time.Now().Add(poolWithIDBenchmarkTimeout)
-	for {
+	for !condition() {
+		if time.Now().After(deadline) {
+			b.Fatalf("timed out waiting for %s", label)
+		}
+		runtime.Gosched()
+	}
+}
+
+func poolWithIDBenchmarkRegistrySize(p *PoolWithID) int {
+	p.lock.Lock()
+	size := len(p.registry.items)
+	p.lock.Unlock()
+	return size
+}
+
+func poolWithIDBenchmarkWaitForIdle(b *testing.B, p *PoolWithID, count int) {
+	b.Helper()
+	poolWithIDBenchmarkWaitFor(b, fmt.Sprintf("%d idle entries", count), func() bool {
 		idle := 0
 		p.lock.Lock()
 		if len(p.registry.items) == count {
@@ -115,57 +126,16 @@ func poolWithIDBenchmarkWaitForIdle(b *testing.B, p *PoolWithID, count int) {
 			}
 		}
 		p.lock.Unlock()
-		if idle == count {
-			return
-		}
-		if time.Now().After(deadline) {
-			b.Fatalf("timed out waiting for %d idle entries; got %d", count, idle)
-		}
-		runtime.Gosched()
-	}
-}
-
-func poolWithIDBenchmarkWaitForCompleted(
-	b *testing.B,
-	completed *atomic.Int64,
-	want int64,
-) {
-	b.Helper()
-	deadline := time.Now().Add(poolWithIDBenchmarkTimeout)
-	for completed.Load() != want {
-		if time.Now().After(deadline) {
-			b.Fatalf("timed out waiting for tasks: completed=%d want=%d",
-				completed.Load(), want)
-		}
-		runtime.Gosched()
-	}
-}
-
-func poolWithIDBenchmarkWaitForEmptyRegistry(b *testing.B, p *PoolWithID) {
-	b.Helper()
-	deadline := time.Now().Add(poolWithIDBenchmarkTimeout)
-	for {
-		p.lock.Lock()
-		registrySize := len(p.registry.items)
-		p.lock.Unlock()
-		if registrySize == 0 && p.Running() == 0 {
-			return
-		}
-		if time.Now().After(deadline) {
-			b.Fatalf("timed out waiting for retired IDs: registry=%d running=%d",
-				registrySize, p.Running())
-		}
-		runtime.Gosched()
-	}
+		return idle == count
+	})
 }
 
 func poolWithIDBenchmarkPopulateIdle(b *testing.B, p *PoolWithID, count int) {
 	b.Helper()
 	var finished sync.WaitGroup
 	finished.Add(count)
-	task := finished.Done
 	for id := 0; id < count; id++ {
-		if err := p.Submit(id, task); err != nil {
+		if err := p.Submit(id, finished.Done); err != nil {
 			b.Fatalf("Submit idle ID %d: %v", id, err)
 		}
 	}
@@ -180,12 +150,15 @@ func poolWithIDBenchmarkPopulateRunning(
 ) func() {
 	b.Helper()
 	release := make(chan struct{})
+	var started sync.WaitGroup
+	started.Add(count)
 	allStarted := make(chan struct{})
-	var started atomic.Int64
+	go func() {
+		started.Wait()
+		close(allStarted)
+	}()
 	task := func() {
-		if started.Add(1) == int64(count) {
-			close(allStarted)
-		}
+		started.Done()
 		<-release
 	}
 	for id := 0; id < count; id++ {
@@ -204,369 +177,416 @@ func poolWithIDBenchmarkPopulateRunning(
 	return func() { once.Do(func() { close(release) }) }
 }
 
-func poolWithIDBenchmarkSamples(n int) []int64 {
-	if n > poolWithIDBenchmarkMaxSample {
-		n = poolWithIDBenchmarkMaxSample
+func poolWithIDBenchmarkTask(cpu bool) func() {
+	if !cpu {
+		return func() {}
 	}
-	return make([]int64, n)
-}
-
-func poolWithIDBenchmarkTask(cpu bool, completed *atomic.Int64) func() {
 	return func() {
-		if cpu {
-			value := uint64(0x9e3779b97f4a7c15)
-			for range 64 {
-				value ^= value << 7
-				value ^= value >> 9
-				value *= 0xbf58476d1ce4e5b9
-			}
-			poolWithIDBenchmarkSink.Add(value)
+		value := uint64(0x9e3779b97f4a7c15)
+		for i := 0; i < 64; i++ {
+			value ^= value << 7
+			value ^= value >> 9
+			value *= 0xbf58476d1ce4e5b9
 		}
-		completed.Add(1)
+		runtime.KeepAlive(value)
 	}
 }
 
-func poolWithIDBenchmarkReport(
-	b *testing.B,
-	lock *poolWithIDBenchmarkLock,
-	scanned int64,
-	tasks int64,
-	samples []int64,
-	elapsed time.Duration,
-) {
-	b.Helper()
-	sort.Slice(samples, func(i, j int) bool { return samples[i] < samples[j] })
-	percentile := func(p int) float64 {
-		return float64(samples[(len(samples)-1)*p/100])
-	}
-	b.ReportMetric(float64(scanned)/float64(b.N), "scanned/op")
-	b.ReportMetric(float64(lock.total.Load())/float64(b.N), "lock-ns/op")
-	b.ReportMetric(percentile(50), "p50-ns/op")
-	b.ReportMetric(percentile(95), "p95-ns/op")
-	b.ReportMetric(percentile(99), "p99-ns/op")
-	b.ReportMetric(float64(b.N)/elapsed.Seconds(), "ops/s")
-	if tasks > 0 {
-		b.ReportMetric(float64(tasks)/elapsed.Seconds(), "tasks/s")
-	}
+type poolWithIDBenchmarkSubmitResult struct {
+	accepted   int64
+	rejected   int64
+	unexpected error
 }
 
-func poolWithIDBenchmarkReportTasks(
-	b *testing.B,
-	accepted, rejected int64,
-	samples []int64,
-	elapsed time.Duration,
-) {
-	b.Helper()
-	sort.Slice(samples, func(i, j int) bool { return samples[i] < samples[j] })
-	percentile := func(p int) float64 {
-		return float64(samples[(len(samples)-1)*p/100])
-	}
-	b.ReportMetric(float64(accepted)/float64(b.N), "accepted/op")
-	b.ReportMetric(float64(rejected)/float64(b.N), "rejected/op")
-	b.ReportMetric(percentile(50), "p50-ns/op")
-	b.ReportMetric(percentile(95), "p95-ns/op")
-	b.ReportMetric(percentile(99), "p99-ns/op")
-	b.ReportMetric(float64(accepted)/elapsed.Seconds(), "tasks/s")
-}
-
-func poolWithIDBenchmarkRunParallel(
+func poolWithIDBenchmarkRunThroughput(
 	b *testing.B,
 	p *PoolWithID,
 	idCount int,
 	task func(),
-	completed *atomic.Int64,
 	allowOverload bool,
 ) {
 	b.Helper()
-	samples := poolWithIDBenchmarkSamples(b.N)
-	var sequence atomic.Int64
-	var sampleCount atomic.Int64
-	var accepted atomic.Int64
-	var rejected atomic.Int64
-	var unexpected atomic.Bool
+	results := make(chan poolWithIDBenchmarkSubmitResult, runtime.GOMAXPROCS(0))
 
 	b.ReportAllocs()
 	b.ResetTimer()
-	startedAt := time.Now()
 	b.RunParallel(func(pb *testing.PB) {
+		result := poolWithIDBenchmarkSubmitResult{}
+		id := 0
 		for pb.Next() {
-			index := sequence.Add(1) - 1
-			started := time.Now()
-			err := p.Submit(int(index%int64(idCount)), task)
-			elapsed := time.Since(started).Nanoseconds()
-			if sample := sampleCount.Add(1) - 1; sample < int64(len(samples)) {
-				samples[sample] = elapsed
+			err := p.Submit(id, task)
+			switch {
+			case err == nil:
+				result.accepted++
+			case errors.Is(err, ErrPoolOverload):
+				result.rejected++
+			case result.unexpected == nil:
+				result.unexpected = err
 			}
-			if err == nil {
-				accepted.Add(1)
-				continue
+			id++
+			if id == idCount {
+				id = 0
 			}
-			if !errors.Is(err, ErrPoolOverload) {
-				unexpected.Store(true)
-			}
-			rejected.Add(1)
 		}
+		results <- result
 	})
-	poolWithIDBenchmarkWaitForCompleted(b, completed, accepted.Load())
-	elapsed := time.Since(startedAt)
 	b.StopTimer()
+	close(results)
 
-	if unexpected.Load() {
-		b.Fatal("Submit returned an unexpected error")
+	var accepted, rejected int64
+	for result := range results {
+		accepted += result.accepted
+		rejected += result.rejected
+		if result.unexpected != nil {
+			b.Fatalf("Submit returned unexpected error: %v", result.unexpected)
+		}
 	}
-	if !allowOverload && rejected.Load() != 0 {
-		b.Fatalf("Submit rejected %d benchmark tasks", rejected.Load())
+	if !allowOverload && rejected != 0 {
+		b.Fatalf("Submit rejected %d benchmark tasks", rejected)
 	}
-	poolWithIDBenchmarkReportTasks(
-		b,
-		accepted.Load(),
-		rejected.Load(),
-		samples,
-		elapsed,
-	)
+	b.ReportMetric(float64(accepted)/float64(b.N), "accepted/op")
+	b.ReportMetric(float64(rejected)/float64(b.N), "rejected/op")
 }
 
-func BenchmarkPoolWithIDPurge(b *testing.B) {
-	for _, count := range poolWithIDBenchmarkSizes {
-		b.Run("idle/"+benchmarkPoolWithIDSizeName(count), func(b *testing.B) {
-			p, measuredLock := poolWithIDBenchmarkNew(b, count)
-			defer poolWithIDBenchmarkRelease(b, p)
-			poolWithIDBenchmarkPopulateIdle(b, p, count)
-
-			var scanned atomic.Int64
-			p.testHooks.afterPurgeEntryVisited = func() { scanned.Add(1) }
-			now := time.Now()
-			samples := poolWithIDBenchmarkSamples(b.N)
-			b.ReportAllocs()
-			measuredLock.reset()
-			b.ResetTimer()
-			startedAt := time.Now()
-			for i := 0; i < b.N; i++ {
-				started := time.Now()
-				p.purgeExpired(now)
-				samples[i%len(samples)] = time.Since(started).Nanoseconds()
-			}
-			elapsed := time.Since(startedAt)
-			b.StopTimer()
-			poolWithIDBenchmarkReport(b, measuredLock, scanned.Load(), 0, samples, elapsed)
-		})
-
-		b.Run("running/"+benchmarkPoolWithIDSizeName(count), func(b *testing.B) {
-			p, measuredLock := poolWithIDBenchmarkNew(b, count)
-			releaseTasks := poolWithIDBenchmarkPopulateRunning(b, p, count)
-			defer func() {
-				releaseTasks()
-				poolWithIDBenchmarkRelease(b, p)
-			}()
-
-			var scanned atomic.Int64
-			p.testHooks.afterPurgeEntryVisited = func() { scanned.Add(1) }
-			now := time.Now()
-			samples := poolWithIDBenchmarkSamples(b.N)
-			b.ReportAllocs()
-			measuredLock.reset()
-			b.ResetTimer()
-			startedAt := time.Now()
-			for i := 0; i < b.N; i++ {
-				started := time.Now()
-				p.purgeExpired(now)
-				samples[i%len(samples)] = time.Since(started).Nanoseconds()
-			}
-			elapsed := time.Since(startedAt)
-			b.StopTimer()
-			poolWithIDBenchmarkReport(b, measuredLock, scanned.Load(), 0, samples, elapsed)
-		})
-	}
-}
-
-func BenchmarkPoolWithIDSubmit(b *testing.B) {
-	for _, count := range poolWithIDBenchmarkSizes {
-		b.Run(benchmarkPoolWithIDSizeName(count), func(b *testing.B) {
-			p, measuredLock := poolWithIDBenchmarkNew(b, count)
-			defer poolWithIDBenchmarkRelease(b, p)
-			poolWithIDBenchmarkPopulateIdle(b, p, count)
-
-			samples := poolWithIDBenchmarkSamples(b.N)
-			var sequence atomic.Int64
-			var sampleCount atomic.Int64
-			var submitted atomic.Int64
-			var completed atomic.Int64
-			var rejected atomic.Int64
-			task := func() { completed.Add(1) }
-
-			b.ReportAllocs()
-			measuredLock.reset()
-			b.ResetTimer()
-			startedAt := time.Now()
-			b.RunParallel(func(pb *testing.PB) {
-				for pb.Next() {
-					index := sequence.Add(1) - 1
-					started := time.Now()
-					err := p.Submit(int(index%int64(count)), task)
-					elapsed := time.Since(started).Nanoseconds()
-					if sample := sampleCount.Add(1) - 1; sample < int64(len(samples)) {
-						samples[sample] = elapsed
-					}
-					if err != nil {
-						rejected.Add(1)
-						continue
-					}
-					submitted.Add(1)
-				}
-			})
-
-			deadline := time.Now().Add(poolWithIDBenchmarkTimeout)
-			for completed.Load() != submitted.Load() {
-				if time.Now().After(deadline) {
-					b.Fatalf("timed out waiting for submitted tasks: completed=%d submitted=%d",
-						completed.Load(), submitted.Load())
-				}
-				runtime.Gosched()
-			}
-			if got := rejected.Load(); got != 0 {
-				b.Fatalf("Submit rejected %d benchmark tasks", got)
-			}
-			elapsed := time.Since(startedAt)
-			b.StopTimer()
-			poolWithIDBenchmarkReport(
-				b,
-				measuredLock,
-				0,
-				submitted.Load(),
-				samples,
-				elapsed,
-			)
-		})
-	}
-}
-
-func BenchmarkPoolWithIDSteadyState(b *testing.B) {
+func BenchmarkPoolWithIDThroughput(b *testing.B) {
 	scenarios := [...]struct {
-		name       string
-		ids        int
-		taskBuffer int
-		overload   bool
+		name          string
+		ids           int
+		taskBuffer    int
+		nonblocking   bool
+		disablePurge  bool
+		allowOverload bool
 	}{
 		{name: "single", ids: 1, taskBuffer: 1_024},
-		{name: "multi", ids: 1_000, taskBuffer: 16},
-		{name: "saturated", ids: 1, taskBuffer: 1, overload: true},
+		{name: "multi", ids: 1_000, taskBuffer: 64},
+		{name: "multi-disable-purge", ids: 1_000, taskBuffer: 64, disablePurge: true},
+		{
+			name:          "saturated-nonblocking",
+			ids:           1,
+			taskBuffer:    1,
+			nonblocking:   true,
+			disablePurge:  true,
+			allowOverload: true,
+		},
 	}
+	taskKinds := [...]struct {
+		name string
+		cpu  bool
+	}{
+		{name: "empty"},
+		{name: "cpu", cpu: true},
+	}
+
 	for _, scenario := range scenarios {
-		for _, kind := range poolWithIDBenchmarkTaskKinds {
+		for _, kind := range taskKinds {
 			b.Run(scenario.name+"/"+kind.name, func(b *testing.B) {
-				p := poolWithIDBenchmarkNewP3Mode(
+				p := poolWithIDBenchmarkNewMode(
 					b,
 					scenario.ids,
 					scenario.taskBuffer,
-					scenario.overload,
+					scenario.nonblocking,
+					scenario.disablePurge,
 				)
 				defer poolWithIDBenchmarkRelease(b, p)
-				if !scenario.overload {
-					poolWithIDBenchmarkPopulateIdle(b, p, scenario.ids)
-				}
-				var completed atomic.Int64
-				task := poolWithIDBenchmarkTask(kind.cpu, &completed)
-				poolWithIDBenchmarkRunParallel(
+				poolWithIDBenchmarkPopulateIdle(b, p, scenario.ids)
+				poolWithIDBenchmarkRunThroughput(
 					b,
 					p,
 					scenario.ids,
-					task,
-					&completed,
-					scenario.overload,
+					poolWithIDBenchmarkTask(kind.cpu),
+					scenario.allowOverload,
 				)
 			})
 		}
 	}
+}
 
-	for _, kind := range poolWithIDBenchmarkTaskKinds {
-		b.Run("churn/"+kind.name, func(b *testing.B) {
-			p := poolWithIDBenchmarkNewP3(b, -1, 16)
+func BenchmarkPoolWithIDLockDiagnostics(b *testing.B) {
+	for _, count := range poolWithIDBenchmarkDiagnosticSizes {
+		name := benchmarkPoolWithIDSizeName(count)
+		b.Run("submit/"+name, func(b *testing.B) {
+			p, lock := poolWithIDBenchmarkNewDiagnostic(b, count)
 			defer poolWithIDBenchmarkRelease(b, p)
-			var completed atomic.Int64
-			task := poolWithIDBenchmarkTask(kind.cpu, &completed)
-			samples := poolWithIDBenchmarkSamples(b.N)
-			const batchSize = 128
-			var accepted int64
+			poolWithIDBenchmarkPopulateIdle(b, p, count)
+			lock.reset()
+			poolWithIDBenchmarkRunThroughput(b, p, count, func() {}, false)
+			b.ReportMetric(float64(lock.total.Load())/float64(b.N), "lock-ns/op")
+		})
+
+		b.Run("purge-idle/"+name, func(b *testing.B) {
+			p, lock := poolWithIDBenchmarkNewDiagnostic(b, count)
+			defer poolWithIDBenchmarkRelease(b, p)
+			poolWithIDBenchmarkPopulateIdle(b, p, count)
+			now := time.Now()
+			lock.reset()
+			b.ReportAllocs()
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				p.purgeExpired(now)
+			}
+			b.StopTimer()
+			b.ReportMetric(float64(lock.total.Load())/float64(b.N), "lock-ns/op")
+		})
+
+		b.Run("purge-running/"+name, func(b *testing.B) {
+			p, lock := poolWithIDBenchmarkNewDiagnostic(b, count)
+			release := poolWithIDBenchmarkPopulateRunning(b, p, count)
+			defer func() {
+				release()
+				poolWithIDBenchmarkRelease(b, p)
+			}()
+			now := time.Now()
+			lock.reset()
+			b.ReportAllocs()
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				p.purgeExpired(now)
+			}
+			b.StopTimer()
+			b.ReportMetric(float64(lock.total.Load())/float64(b.N), "lock-ns/op")
+		})
+	}
+}
+
+func poolWithIDBenchmarkSetIdleEligibility(
+	b *testing.B,
+	p *PoolWithID,
+	eligible int,
+	now time.Time,
+) {
+	b.Helper()
+	p.registry.expiryMu.Lock()
+	visited := 0
+	for entry := p.registry.idle.head; entry != nil; entry = entry.expiryNext {
+		entry.mu.Lock()
+		if visited < eligible {
+			entry.lastIdleAt = now.Add(-2 * time.Hour)
+		} else {
+			entry.lastIdleAt = now
+		}
+		entry.mu.Unlock()
+		visited++
+	}
+	p.registry.expiryMu.Unlock()
+	if visited != poolWithIDBenchmarkRegistrySize(p) {
+		b.Fatalf("expiry list has %d entries, registry has %d", visited,
+			poolWithIDBenchmarkRegistrySize(p))
+	}
+}
+
+func poolWithIDBenchmarkNewPurgeState(
+	b *testing.B,
+	entries, eligible int,
+) (*PoolWithID, time.Time) {
+	b.Helper()
+	p := poolWithIDBenchmarkNewMode(b, entries, 1, false, false)
+	poolWithIDBenchmarkPopulateIdle(b, p, entries)
+	now := time.Now()
+	poolWithIDBenchmarkSetIdleEligibility(b, p, eligible, now)
+	return p, now
+}
+
+func BenchmarkPoolWithIDPurgeTransitions(b *testing.B) {
+	const entries = 256
+
+	b.Run("none", func(b *testing.B) {
+		p, now := poolWithIDBenchmarkNewPurgeState(b, entries, 0)
+		defer poolWithIDBenchmarkRelease(b, p)
+		b.ReportAllocs()
+		b.ResetTimer()
+		for i := 0; i < b.N; i++ {
+			p.purgeExpired(now)
+		}
+		b.StopTimer()
+		b.ReportMetric(0, "retired/op")
+	})
+
+	for _, scenario := range []struct {
+		name     string
+		eligible int
+	}{
+		{name: "half", eligible: entries / 2},
+		{name: "all", eligible: entries},
+	} {
+		b.Run(scenario.name, func(b *testing.B) {
+			var retired int64
+			b.ReportAllocs()
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				b.StopTimer()
+				p, now := poolWithIDBenchmarkNewPurgeState(b, entries, scenario.eligible)
+				b.StartTimer()
+				p.purgeExpired(now)
+				b.StopTimer()
+				retired += int64(entries - poolWithIDBenchmarkRegistrySize(p))
+				poolWithIDBenchmarkRelease(b, p)
+			}
+			b.ReportMetric(float64(retired)/float64(b.N), "retired/op")
+		})
+	}
+}
+
+func BenchmarkPoolWithIDEscapeReplacement(b *testing.B) {
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		b.StopTimer()
+		p := poolWithIDBenchmarkNewPool(
+			b,
+			1,
+			WithExpiryDuration(time.Hour),
+			WithRunningTaskTimeout(time.Hour),
+			WithTaskBuffer(1),
+			WithMaxEscapedWorkers(1),
+			WithMaxEscapedWorkersPerID(1),
+		)
+		release := make(chan struct{})
+		started := make(chan struct{})
+		if err := p.Submit(0, func() {
+			close(started)
+			<-release
+		}); err != nil {
+			close(release)
+			b.Fatalf("Submit running task: %v", err)
+		}
+		<-started
+		if err := p.Submit(0, func() {}); err != nil {
+			close(release)
+			b.Fatalf("Submit queued task: %v", err)
+		}
+		now := time.Now().Add(2 * time.Hour)
+		b.StartTimer()
+		p.purgeExpired(now)
+		b.StopTimer()
+		close(release)
+		poolWithIDBenchmarkWaitFor(b, "escaped owner exit", func() bool {
+			return p.Escaped() == 0
+		})
+		poolWithIDBenchmarkRelease(b, p)
+	}
+	b.ReportMetric(1, "replacements/op")
+}
+
+func BenchmarkPoolWithIDEscapeEventChannelFull(b *testing.B) {
+	p := poolWithIDBenchmarkNewMode(b, 1, 1, false, true)
+	defer poolWithIDBenchmarkRelease(b, p)
+	event := PoolWithIDEscapeEvent{Type: PoolWithIDWorkerEscaped, ID: 1}
+	for i := 0; i < cap(p.escape.events); i++ {
+		p.escape.events <- event
+	}
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		p.publishEscapeEvent(event)
+	}
+	b.StopTimer()
+	b.ReportMetric(float64(p.DroppedEscapeEvents())/float64(b.N), "dropped/op")
+}
+
+func BenchmarkPoolWithIDEscapeSnapshotHighCardinality(b *testing.B) {
+	for _, cardinality := range []int{1_000, 10_000} {
+		b.Run(benchmarkPoolWithIDSizeName(cardinality), func(b *testing.B) {
+			p := poolWithIDBenchmarkNewPool(
+				b,
+				1,
+				WithDisablePurge(true),
+				WithMaxEscapedWorkers(cardinality+1),
+				WithMaxEscapedWorkersPerID(1),
+			)
+			defer poolWithIDBenchmarkRelease(b, p)
+			p.escape.mu.Lock()
+			p.escape.total = cardinality
+			for id := 0; id < cardinality; id++ {
+				p.escape.byID[id] = 1
+				p.escape.exhaustedByID[id] = PoolWithIDEscapePerIDBudgetExhausted
+			}
+			p.escape.mu.Unlock()
 
 			b.ReportAllocs()
 			b.ResetTimer()
-			startedAt := time.Now()
-			for accepted < int64(b.N) {
-				batch := int64(batchSize)
-				if remaining := int64(b.N) - accepted; remaining < batch {
-					batch = remaining
-				}
-				completedBefore := completed.Load()
-				for range batch {
-					started := time.Now()
-					err := p.Submit(int(accepted), task)
-					samples[accepted%int64(len(samples))] = time.Since(started).Nanoseconds()
-					if err != nil {
-						b.Fatalf("Submit churn ID %d: %v", accepted, err)
-					}
-					accepted++
-				}
-				poolWithIDBenchmarkWaitForCompleted(
-					b,
-					&completed,
-					completedBefore+batch,
-				)
-				poolWithIDBenchmarkWaitForIdle(b, p, int(batch))
-				p.purgeExpired(time.Now().Add(2 * time.Hour))
-				poolWithIDBenchmarkWaitForEmptyRegistry(b, p)
+			for i := 0; i < b.N; i++ {
+				snapshot := p.EscapeSnapshot()
+				runtime.KeepAlive(snapshot)
 			}
-			elapsed := time.Since(startedAt)
 			b.StopTimer()
-			poolWithIDBenchmarkReportTasks(b, accepted, 0, samples, elapsed)
+			b.ReportMetric(float64(cardinality), "ids/op")
+		})
+	}
+}
+
+func BenchmarkPoolWithIDReleaseStorm(b *testing.B) {
+	const entries = 64
+	for _, callers := range []int{1, 8, 64} {
+		b.Run(fmt.Sprintf("callers-%d", callers), func(b *testing.B) {
+			b.ReportAllocs()
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				b.StopTimer()
+				p := poolWithIDBenchmarkNewMode(b, entries, 1, false, true)
+				poolWithIDBenchmarkPopulateIdle(b, p, entries)
+				start := make(chan struct{})
+				results := make(chan error, callers)
+				var ready, finished sync.WaitGroup
+				ready.Add(callers)
+				finished.Add(callers)
+				for caller := 0; caller < callers; caller++ {
+					go func() {
+						defer finished.Done()
+						ready.Done()
+						<-start
+						results <- p.ReleaseTimeout(poolWithIDBenchmarkTimeout)
+					}()
+				}
+				ready.Wait()
+				b.StartTimer()
+				close(start)
+				finished.Wait()
+				b.StopTimer()
+				for caller := 0; caller < callers; caller++ {
+					if err := <-results; err != nil && !errors.Is(err, ErrPoolClosed) {
+						b.Fatalf("ReleaseTimeout storm: %v", err)
+					}
+				}
+			}
+			b.ReportMetric(float64(callers), "callers/op")
 		})
 	}
 }
 
 func BenchmarkPoolWithIDLifecycle(b *testing.B) {
-	for _, kind := range poolWithIDBenchmarkTaskKinds {
-		b.Run("reboot/"+kind.name, func(b *testing.B) {
-			const (
-				ids       = 64
-				batchSize = 64
-			)
-			p := poolWithIDBenchmarkNewP3(b, ids, batchSize)
+	const ids = 64
+	for _, cpu := range []bool{false, true} {
+		name := "empty"
+		if cpu {
+			name = "cpu"
+		}
+		b.Run("reboot/"+name, func(b *testing.B) {
+			p := poolWithIDBenchmarkNewMode(b, ids, ids, false, true)
 			defer poolWithIDBenchmarkRelease(b, p)
-			var completed atomic.Int64
-			task := poolWithIDBenchmarkTask(kind.cpu, &completed)
-			samples := poolWithIDBenchmarkSamples(b.N)
-			var accepted int64
-
+			work := poolWithIDBenchmarkTask(cpu)
 			b.ReportAllocs()
 			b.ResetTimer()
-			startedAt := time.Now()
-			for accepted < int64(b.N) {
-				batch := int64(batchSize)
-				if remaining := int64(b.N) - accepted; remaining < batch {
-					batch = remaining
+			for generation := 0; generation < b.N; generation++ {
+				var finished sync.WaitGroup
+				finished.Add(ids)
+				task := func() {
+					work()
+					finished.Done()
 				}
-				completedBefore := completed.Load()
-				for i := range batch {
-					started := time.Now()
-					err := p.Submit(int(i)%ids, task)
-					samples[accepted%int64(len(samples))] = time.Since(started).Nanoseconds()
-					if err != nil {
+				for id := 0; id < ids; id++ {
+					if err := p.Submit(id, task); err != nil {
 						b.Fatalf("Submit lifecycle task: %v", err)
 					}
-					accepted++
 				}
-				poolWithIDBenchmarkWaitForCompleted(
-					b,
-					&completed,
-					completedBefore+batch,
-				)
+				finished.Wait()
 				if err := p.ReleaseTimeout(poolWithIDBenchmarkTimeout); err != nil {
 					b.Fatalf("ReleaseTimeout lifecycle generation: %v", err)
 				}
 				p.Reboot()
 			}
-			elapsed := time.Since(startedAt)
 			b.StopTimer()
-			poolWithIDBenchmarkReportTasks(b, accepted, 0, samples, elapsed)
+			b.ReportMetric(ids, "tasks/op")
 		})
 	}
 }
@@ -580,6 +600,6 @@ func benchmarkPoolWithIDSizeName(size int) string {
 	case 100_000:
 		return "100k"
 	default:
-		return "unknown"
+		return fmt.Sprintf("%d", size)
 	}
 }
