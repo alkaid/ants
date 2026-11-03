@@ -192,7 +192,7 @@ type poolCommon struct {
 	// running is the number of the currently running goroutines.
 	running int32
 
-	// lock for protecting the worker queue.
+	// lock protects the worker queue and pool lifecycle transitions.
 	lock sync.Locker
 
 	// workers is a slice that store the available workers.
@@ -204,10 +204,8 @@ type poolCommon struct {
 	// cond for waiting to get an idle worker.
 	cond *sync.Cond
 
-	// done is used to indicate that all workers are done.
+	// allDone is closed under lock when a closed pool has no running workers.
 	allDone chan struct{}
-	// once is used to make sure the pool is closed just once.
-	once *sync.Once
 
 	// workerCache speeds up the obtainment of a usable worker in function:retrieveWorker.
 	workerCache sync.Pool
@@ -270,7 +268,6 @@ func newPoolCommon(size int, allocateWorkerQueue bool, options ...Option) (*pool
 		capacity: int32(size),
 		allDone:  make(chan struct{}),
 		lock:     syncx.NewSpinLock(),
-		once:     &sync.Once{},
 		options:  opts,
 	}
 	if allocateWorkerQueue && p.options.PreAlloc {
@@ -425,8 +422,15 @@ func (p *poolCommon) IsClosed() bool {
 
 // Release closes this pool and releases the worker queue.
 func (p *poolCommon) Release() {
+	p.lock.Lock()
+	p.releaseLocked()
+	p.lock.Unlock()
+}
+
+// releaseLocked closes the current generation while holding p.lock.
+func (p *poolCommon) releaseLocked() bool {
 	if !atomic.CompareAndSwapInt32(&p.state, OPENED, CLOSED) {
-		return
+		return false
 	}
 
 	if p.stopPurge != nil {
@@ -438,9 +442,7 @@ func (p *poolCommon) Release() {
 		p.stopTicktock = nil
 	}
 
-	p.lock.Lock()
 	p.workers.reset()
-	p.lock.Unlock()
 
 	// There might be some callers waiting in retrieveWorker(), so we need to wake them up to prevent
 	// those callers blocking infinitely.
@@ -450,10 +452,9 @@ func (p *poolCommon) Release() {
 	// so that Reboot() or ReleaseContext() won't block on <-p.allDone indefinitely.
 	// If workers are still running, the last one to exit will close allDone in its defer.
 	if p.Running() == 0 {
-		p.once.Do(func() {
-			close(p.allDone)
-		})
+		close(p.allDone)
 	}
+	return true
 }
 
 // ReleaseTimeout is like Release but with a timeout, it waits all workers to exit before timing out.
@@ -472,75 +473,85 @@ func (p *poolCommon) ReleaseTimeout(timeout time.Duration) error {
 // Note that if the context is nil, it is the same as Release,
 // just return immediately without waiting for all workers to exit.
 func (p *poolCommon) ReleaseContext(ctx context.Context) error {
-	if p.IsClosed() || (!p.options.DisablePurge && p.stopPurge == nil) || p.stopTicktock == nil {
+	p.lock.Lock()
+	if !p.releaseLocked() {
+		p.lock.Unlock()
 		return ErrPoolClosed
 	}
-
-	p.Release()
+	done := p.allDone
+	p.lock.Unlock()
 
 	// Don't wait for all workers to exit, just return immediately if the context is nil.
 	if ctx == nil {
 		return nil
 	}
 
-	var purgeCh <-chan struct{}
-	if !p.options.DisablePurge {
-		purgeCh = p.purgeCtx.Done()
-	} else {
-		purgeCh = p.allDone
-	}
-
 	for {
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
-		case <-p.allDone:
-			<-purgeCh
-			<-p.ticktockCtx.Done()
-			if p.Running() == 0 &&
-				(p.options.DisablePurge || atomic.LoadInt32(&p.purgeDone) == 1) &&
-				atomic.LoadInt32(&p.ticktockDone) == 1 {
+		case <-done:
+			p.lock.Lock()
+			// A replacement channel means Reboot already waited for this
+			// generation's background goroutines to finish.
+			finished := p.allDone != done || p.backgroundStopped()
+			p.lock.Unlock()
+			if finished {
 				return nil
 			}
+			runtime.Gosched()
 		}
 	}
 }
 
-// Reboot reboots a closed pool, it does nothing if the pool is not closed.
-// If you intend to reboot a closed pool, use ReleaseTimeout() instead of
-// Release() to ensure that all workers are stopped and resource are released
-// before rebooting, otherwise you may run into data race.
+// Reboot waits for a closed pool's workers and background goroutines to stop,
+// then reopens it. It does nothing if the pool is not closed.
 func (p *poolCommon) Reboot() {
-	if atomic.LoadInt32(&p.state) != CLOSED {
+	p.lock.Lock()
+	if !p.IsClosed() {
+		p.lock.Unlock()
 		return
 	}
+	done := p.allDone
+	p.lock.Unlock()
 
 	// Wait for all workers to exit. The allDone channel is closed either
 	// by Release() (if no workers were running) or by the last exiting worker.
-	<-p.allDone
+	<-done
 
-	// Wait for the purge and ticktock goroutines to exit completely,
-	// so that their deferred purgeDone/ticktockDone stores don't
-	// race with the resets below.
-	if !p.options.DisablePurge {
-		for atomic.LoadInt32(&p.purgeDone) != 1 {
-			runtime.Gosched()
+	for {
+		p.lock.Lock()
+		// Another Reboot may have replaced the generation while we waited.
+		if p.allDone != done || !p.IsClosed() {
+			p.lock.Unlock()
+			return
 		}
-	}
-	for atomic.LoadInt32(&p.ticktockDone) != 1 {
+		if p.backgroundStopped() {
+			break
+		}
+		p.lock.Unlock()
 		runtime.Gosched()
 	}
 
-	if !atomic.CompareAndSwapInt32(&p.state, CLOSED, OPENED) {
-		return
-	}
-
-	atomic.StoreInt32(&p.purgeDone, 0)
-	p.goPurge()
-	atomic.StoreInt32(&p.ticktockDone, 0)
-	p.goTicktock()
 	p.allDone = make(chan struct{})
-	p.once = &sync.Once{}
+	atomic.StoreInt32(&p.purgeDone, 0)
+	atomic.StoreInt32(&p.ticktockDone, 0)
+	atomic.StoreInt32(&p.state, OPENED)
+	p.startBackground()
+	p.lock.Unlock()
+}
+
+func (p *poolCommon) backgroundStopped() bool {
+	return (p.options.DisablePurge || atomic.LoadInt32(&p.purgeDone) == 1) &&
+		atomic.LoadInt32(&p.ticktockDone) == 1
+}
+
+func (p *poolCommon) workerExited() {
+	p.lock.Lock()
+	if p.addRunning(-1) == 0 && p.IsClosed() {
+		close(p.allDone)
+	}
+	p.lock.Unlock()
 }
 
 func (p *poolCommon) addRunning(delta int) int {
@@ -556,6 +567,11 @@ func (p *poolCommon) retrieveWorker() (w worker, err error) {
 	p.lock.Lock()
 
 retry:
+	if p.IsClosed() {
+		p.lock.Unlock()
+		return nil, ErrPoolClosed
+	}
+
 	// First try to fetch the worker from the queue.
 	if w = p.workers.detach(); w != nil {
 		p.lock.Unlock()
@@ -584,11 +600,6 @@ retry:
 	}
 	p.cond.Wait() // block and wait for an available worker
 	p.addWaiting(-1)
-
-	if p.IsClosed() {
-		p.lock.Unlock()
-		return nil, ErrPoolClosed
-	}
 
 	goto retry
 }

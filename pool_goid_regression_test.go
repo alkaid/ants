@@ -7,16 +7,15 @@ import (
 	"time"
 )
 
-// poolWithIDExpiryBarrier pauses one acquisition before taking the underlying
-// lock, modeling a submitter descheduled before its expiry-index update.
-type poolWithIDExpiryBarrier struct {
+// poolTestLockBarrier pauses one acquisition before taking the underlying lock.
+type poolTestLockBarrier struct {
 	sync.Locker
 	armed   atomic.Bool
 	reached chan struct{}
 	resume  chan struct{}
 }
 
-func (b *poolWithIDExpiryBarrier) Lock() {
+func (b *poolTestLockBarrier) Lock() {
 	if b.armed.CompareAndSwap(true, false) {
 		close(b.reached)
 		<-b.resume
@@ -43,7 +42,7 @@ func TestPoolWithIDOverlappingSubmitFinalizersKeepEntryRegistered(t *testing.T) 
 			}
 			poolWithIDReceive(t, keeperStarted)
 
-			barrier := &poolWithIDExpiryBarrier{
+			barrier := &poolTestLockBarrier{
 				Locker:  p.registry.expiryMu,
 				reached: make(chan struct{}),
 				resume:  make(chan struct{}),
