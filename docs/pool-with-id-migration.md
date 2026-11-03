@@ -3,8 +3,8 @@
 状态：适用于内部版本 `v2.12.1-ak-3`，2026-07-24
 
 > 本文描述 `v2.12.1-ak-3` 已实现的 API 和运行语义。该版本仅用于
-> `github.com/alkaid/ants/v2` 内部镜像；本地 tag 不代表公开 release，也不会
-> 建立 fork 的公开发布或 CI 身份。
+> `github.com/alkaid/ants/v2` 内部镜像。`v2.12.1-ak-4` 沿用这些 API 和默认配置，
+> 并修复两处并发问题，详见[版本说明](internal-release-notes-v2.12.1-ak-4.md)。
 
 本文覆盖两条迁移路径:
 
@@ -290,4 +290,4 @@ event channel 满时允许丢事件, 所以告警不能只依赖逐条 event。�
 
 内部镜像保留 Go 1.19 与当前 stable 的 test CI、CodeQL 和必要的 PR 检查, 但不运行 Release Drafter, 不保留 upstream Funding 元数据, 也不向外部 Codecov 项目上传覆盖率。
 
-本文是内部迁移与运维材料，不是公开 release announcement。版本交付使用本地轻量 tag，不 push，也不创建 GitHub release。
+本文是内部迁移与运维材料。版本交付以仓库 tag 和对应版本说明为准。

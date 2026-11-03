@@ -36,15 +36,15 @@ type workerIDEntry struct {
 	owner      *goWorkerWithID
 
 	// pendingSubmits counts callers that registered while the pool was open but
-	// have not yet completed their channel send attempt. outstanding counts
-	// those callers plus accepted tasks not yet taken by an owner. Keeping both
-	// closes the receive-to-task-start window for purge and release.
+	// have not yet completed their send attempt and expiry-index update.
+	// outstanding counts unresolved send attempts plus accepted tasks not yet
+	// taken by an owner. Keeping both closes the receive-to-task-start window
+	// for purge and release.
 	pendingSubmits int
 	outstanding    int
 
 	taskStartedAt time.Time
 	lastIdleAt    time.Time
-	expiryPending bool
 
 	expiryPrev *workerIDEntry
 	expiryNext *workerIDEntry
@@ -82,7 +82,7 @@ func newWorkerIDEntry(
 
 func (e *workerIDEntry) drained() bool {
 	return e.pendingSubmits == 0 && e.outstanding == 0 &&
-		e.taskStartedAt.IsZero() && !e.expiryPending
+		e.taskStartedAt.IsZero()
 }
 
 // removeExpiry requires expiryMu.

@@ -28,7 +28,7 @@ func poolWithIDPhase5AssertExpiryIndexEmpty(t *testing.T, p *PoolWithID) {
 	for id, entry := range registry.items {
 		entry.mu.Lock()
 		indexed := entry.expiryList != workerIDEntryListNone ||
-			entry.expiryPrev != nil || entry.expiryNext != nil || entry.expiryPending
+			entry.expiryPrev != nil || entry.expiryNext != nil
 		entry.mu.Unlock()
 		if indexed {
 			t.Fatalf("entry %d retained disabled expiry-index state", id)

@@ -76,22 +76,17 @@ func (w *goWorkerWithID) loop() {
 			}
 
 			panicValue, stack := w.execute(task)
-			panicHandled := false
-			if panicValue != nil && w.pool.isManagedOwner(w) {
+			// Panic callbacks run on this worker and can block or call Goexit.
+			// Keep ownership and escape accounting until the callback finishes;
+			// the outer defer handles accounting if it exits the goroutine.
+			if panicValue != nil {
 				w.pool.handleTaskPanic(w.entry.id, panicValue, stack)
-				panicHandled = true
 			}
 			if w.pool.finishTask(w) {
 				managedOwner = false
 				<-w.stop
 				w.pool.escapedWorkerExited(w)
-				if panicValue != nil && !panicHandled {
-					w.pool.handleTaskPanic(w.entry.id, panicValue, stack)
-				}
 				return
-			}
-			if panicValue != nil && !panicHandled {
-				w.pool.handleTaskPanic(w.entry.id, panicValue, stack)
 			}
 			if hook := w.pool.testHooks.afterTaskFinished; hook != nil {
 				hook()

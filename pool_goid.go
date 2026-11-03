@@ -71,7 +71,6 @@ type PoolWithID struct {
 	registry          *workerIDRegistry
 	reservations      map[int]*workerIDReservation
 	reservedOwners    atomic.Int32
-	nextAllocator     uint64
 	admissionLimit    int
 	generation        atomic.Uint64
 	managedCloseFence atomic.Uint64
@@ -123,12 +122,11 @@ const (
 
 // workerIDReservation owns one capacity slot while its allocator creates the
 // entry outside p.lock. Its fields and map membership are protected by p.lock;
-// only the recorded allocator may commit or abort and close done.
+// the allocating submitter commits or aborts it and closes done.
 type workerIDReservation struct {
 	id         int
 	registry   *workerIDRegistry
 	generation uint64
-	allocator  uint64
 	state      workerIDReservationState
 	done       chan struct{}
 }
@@ -311,7 +309,6 @@ func NewPoolWithID(size int, options ...Option) (*PoolWithID, error) {
 		clock:          poolWithIDClockFactory(),
 		purgeWake:      make(chan struct{}, 1),
 		escape:         newPoolWithIDEscapeState(globalBudget, perIDBudget),
-		purgeFinished:  make(chan struct{}),
 	}
 	p.generation.Store(1)
 	p.startIDBackgroundLocked()
@@ -368,9 +365,8 @@ func (p *PoolWithID) registerSubmit(
 		if capacity == -1 || p.Running()+reserved < capacity {
 			p.releaseWaiterLocked(waiter)
 			reservation := p.reserveOwnerLocked(id, generation)
-			allocator := reservation.allocator
 			p.lock.Unlock()
-			return p.allocateReservedOwner(reservation, allocator)
+			return p.allocateReservedOwner(reservation)
 		}
 
 		if p.options.Nonblocking || !p.acquireWaiterLocked(waiter) {
@@ -408,12 +404,10 @@ func (p *PoolWithID) releaseWaiterLocked(waiter *poolWithIDWaiter) {
 }
 
 func (p *PoolWithID) reserveOwnerLocked(id int, generation uint64) *workerIDReservation {
-	p.nextAllocator++
 	reservation := &workerIDReservation{
 		id:         id,
 		registry:   p.registry,
 		generation: generation,
-		allocator:  p.nextAllocator,
 		state:      workerIDReservationPending,
 		done:       make(chan struct{}),
 	}
@@ -424,11 +418,10 @@ func (p *PoolWithID) reserveOwnerLocked(id int, generation uint64) *workerIDRese
 
 func (p *PoolWithID) allocateReservedOwner(
 	reservation *workerIDReservation,
-	allocator uint64,
 ) (entry *workerIDEntry, stop <-chan struct{}, err error) {
 	defer func() {
 		if panicValue := recover(); panicValue != nil {
-			p.abortReservation(reservation, allocator)
+			p.abortReservation(reservation)
 			panic(panicValue)
 		}
 	}()
@@ -450,7 +443,7 @@ func (p *PoolWithID) allocateReservedOwner(
 		hook(reservation.id)
 	}
 
-	stop, err = p.commitReservation(reservation, allocator, entry, owner)
+	stop, err = p.commitReservation(reservation, entry, owner)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -462,7 +455,6 @@ func (p *PoolWithID) allocateReservedOwner(
 
 func (p *PoolWithID) commitReservation(
 	reservation *workerIDReservation,
-	allocator uint64,
 	entry *workerIDEntry,
 	owner *goWorkerWithID,
 ) (<-chan struct{}, error) {
@@ -470,14 +462,13 @@ func (p *PoolWithID) commitReservation(
 	defer p.lock.Unlock()
 
 	if p.reservations[reservation.id] != reservation ||
-		reservation.allocator != allocator ||
 		reservation.state != workerIDReservationPending {
 		return nil, ErrPoolClosed
 	}
 	if atomic.LoadInt32(&p.state) != OPENED ||
 		p.generation.Load() != reservation.generation ||
 		p.registry != reservation.registry {
-		p.abortReservationLocked(reservation, allocator)
+		p.abortReservationLocked(reservation)
 		return nil, ErrPoolClosed
 	}
 
@@ -496,18 +487,14 @@ func (p *PoolWithID) commitReservation(
 	return p.submitStop, nil
 }
 
-func (p *PoolWithID) abortReservation(reservation *workerIDReservation, allocator uint64) {
+func (p *PoolWithID) abortReservation(reservation *workerIDReservation) {
 	p.lock.Lock()
-	p.abortReservationLocked(reservation, allocator)
+	p.abortReservationLocked(reservation)
 	p.lock.Unlock()
 }
 
-func (p *PoolWithID) abortReservationLocked(
-	reservation *workerIDReservation,
-	allocator uint64,
-) bool {
+func (p *PoolWithID) abortReservationLocked(reservation *workerIDReservation) bool {
 	if p.reservations[reservation.id] != reservation ||
-		reservation.allocator != allocator ||
 		reservation.state != workerIDReservationPending {
 		return false
 	}
@@ -555,14 +542,16 @@ func (p *PoolWithID) appendRunningToExpiryIndex(entry *workerIDEntry) {
 
 func (p *PoolWithID) finishSubmit(entry *workerIDEntry, accepted bool) {
 	entry.mu.Lock()
-	entry.pendingSubmits--
 	if !accepted {
 		entry.outstanding--
 	}
-	idleCandidate := entry.pendingSubmits == 0 && entry.outstanding == 0 &&
+	idleCandidate := entry.pendingSubmits == 1 && entry.outstanding == 0 &&
 		entry.taskStartedAt.IsZero()
-	if idleCandidate && !p.options.DisablePurge {
-		entry.expiryPending = true
+	// Keep this submit registered until its expiry-index update finishes. Other
+	// submitters may finish while we wait for expiryMu, but cannot make the entry
+	// drained and retire it before this submitter has finished indexing it.
+	if !idleCandidate || p.options.DisablePurge {
+		entry.pendingSubmits--
 	}
 	owner := entry.owner
 	entry.mu.Unlock()
@@ -571,7 +560,7 @@ func (p *PoolWithID) finishSubmit(entry *workerIDEntry, accepted bool) {
 		registry := entry.registry
 		p.lockExpiryIndex(registry)
 		entry.mu.Lock()
-		entry.expiryPending = false
+		entry.pendingSubmits--
 		if entry.drained() {
 			entry.lastIdleAt = p.clock.Now()
 			p.appendIdleToExpiryIndex(entry)
@@ -609,14 +598,6 @@ func (p *PoolWithID) startTask(owner *goWorkerWithID) bool {
 	return true
 }
 
-func (p *PoolWithID) isManagedOwner(owner *goWorkerWithID) bool {
-	entry := owner.entry
-	entry.mu.Lock()
-	managed := entry.owner == owner
-	entry.mu.Unlock()
-	return managed
-}
-
 // finishTask returns true when owner was escaped while its task was running.
 func (p *PoolWithID) finishTask(owner *goWorkerWithID) bool {
 	entry := owner.entry
@@ -650,29 +631,7 @@ func (p *PoolWithID) retireOwnerIfDrained(owner *goWorkerWithID) bool {
 		return false
 	}
 
-	entry := owner.entry
-	p.lock.Lock()
-	state = atomic.LoadInt32(&p.state)
-	capacity = p.Cap()
-	overCapacity := capacity > 0 &&
-		len(p.registry.items)+int(p.reservedOwners.Load()) > capacity
-	if state == OPENED && !overCapacity {
-		p.maybeManagedDoneLocked()
-		p.lock.Unlock()
-		return false
-	}
-	registry := entry.registry
-	p.lockExpiryIndex(registry)
-	entry.mu.Lock()
-	retired := p.retireEntryLocked(entry, owner)
-	entry.mu.Unlock()
-	p.unlockExpiryIndex(registry)
-	if retired {
-		p.cond.Broadcast()
-	}
-	p.maybeManagedDoneLocked()
-	p.lock.Unlock()
-	return retired
+	return p.retireEntryIfDrained(owner.entry, owner)
 }
 
 func (p *PoolWithID) retireEntryIfDrained(entry *workerIDEntry, owner *goWorkerWithID) bool {

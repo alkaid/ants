@@ -54,13 +54,12 @@ go get -u github.com/panjf2000/ants
 ### 使用内部 `ants` v2 镜像：
 
 ```powershell
-go get github.com/alkaid/ants/v2@INTERNAL_VERSION
+go get github.com/alkaid/ants/v2@v2.12.1-ak-4
 ```
 
-请把 `INTERNAL_VERSION` 替换为组织批准的内部 Git 服务或 module proxy
-提供的精确版本或提交。本次交付只在当前检出中创建本地轻量 tag
-`v2.12.1-ak-3`，不会推送，也不能通过公共 Go module proxy 获取。内部镜像要求
-Go 1.19 或更高版本。
+请使用能获取 fork tag 的 Git 服务或 module proxy。内部镜像要求 Go 1.19
+或更高版本。本次并发问题修复见
+[v2.12.1-ak-4 版本说明](docs/internal-release-notes-v2.12.1-ak-4.md)。
 
 ## 🛠 使用
 基本用法请查看本地[示例](pool_goid_example_test.go)，或针对内部批准版本运行

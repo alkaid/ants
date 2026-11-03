@@ -189,7 +189,8 @@ func (p *PoolWithID) EscapeBudgetStatus(id int) PoolWithIDEscapeBudgetStatus {
 	return status
 }
 
-// Escaped returns the number of escaped workers whose tasks are still alive.
+// Escaped returns the number of escaped workers still executing a task or its
+// panic callback.
 func (p *PoolWithID) Escaped() int {
 	p.escape.mu.Lock()
 	total := p.escape.total
@@ -197,8 +198,8 @@ func (p *PoolWithID) Escaped() int {
 	return total
 }
 
-// TotalWorkers returns managed owners plus escaped workers whose tasks are
-// still alive.
+// TotalWorkers returns managed owners plus escaped workers still executing a
+// task or its panic callback.
 func (p *PoolWithID) TotalWorkers() int {
 	return p.Running() + p.Escaped()
 }
@@ -290,15 +291,13 @@ func (p *PoolWithID) clearEscapeBudgetExhausted(id int) {
 
 // updateEscapeBudgets installs effective limits and clears reasons recovered by
 // a dynamic default-budget change. It may be called while p.lock is held because
-// it never acquires transitionMu or p.lock. The result reports whether a reason
-// was cleared so the caller can wake the purge loop after dropping p.lock.
-func (p *PoolWithID) updateEscapeBudgets(globalLimit, perIDLimit int) bool {
+// it never acquires transitionMu or p.lock.
+func (p *PoolWithID) updateEscapeBudgets(globalLimit, perIDLimit int) {
 	p.escape.mu.Lock()
 	p.escape.globalLimit = globalLimit
 	p.escape.perIDLimit = perIDLimit
-	recovered := p.escape.clearRecoveredBudgetReasonsLocked()
+	p.escape.clearRecoveredBudgetReasonsLocked()
 	p.escape.mu.Unlock()
-	return recovered
 }
 
 func (p *PoolWithID) escapedWorkerExited(worker *goWorkerWithID) {
@@ -372,15 +371,10 @@ func (s *poolWithIDEscapeState) reconciledReasonForIDLocked(
 	return reason
 }
 
-func (s *poolWithIDEscapeState) clearRecoveredBudgetReasonsLocked() bool {
-	recovered := false
+func (s *poolWithIDEscapeState) clearRecoveredBudgetReasonsLocked() {
 	for id := range s.exhaustedByID {
-		previous := s.exhaustedByID[id]
-		if s.reconciledReasonForIDLocked(id) != previous {
-			recovered = true
-		}
+		s.reconciledReasonForIDLocked(id)
 	}
-	return recovered
 }
 
 func (s *poolWithIDEscapeState) decrementLocked(id int) {

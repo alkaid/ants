@@ -1,8 +1,8 @@
 # v2.12.1-ak-3 Internal Release Notes
 
-This version is for the `github.com/alkaid/ants/v2` internal mirror. Delivery
-uses a local lightweight tag only. The tag is not pushed, and no GitHub release
-or public fork release identity is created.
+This note records the `v2.12.1-ak-3` changes to the
+`github.com/alkaid/ants/v2` internal mirror. Subsequent concurrency fixes are
+described in the [v2.12.1-ak-4 release notes](internal-release-notes-v2.12.1-ak-4.md).
 
 ## Breaking Changes
 

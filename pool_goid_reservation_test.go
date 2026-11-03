@@ -516,7 +516,7 @@ func TestPoolWithIDWaiterTokenTransfersFromCapacityToReservation(t *testing.T) {
 
 	allocatorDone := make(chan error, 1)
 	go func() {
-		entry, _, err := p.allocateReservedOwner(reservation, reservation.allocator)
+		entry, _, err := p.allocateReservedOwner(reservation)
 		if err == nil {
 			p.finishSubmit(entry, false)
 		}

@@ -55,14 +55,13 @@ go get -u github.com/panjf2000/ants
 ### For the internal `ants` v2 mirror
 
 ```powershell
-go get github.com/alkaid/ants/v2@INTERNAL_VERSION
+go get github.com/alkaid/ants/v2@v2.12.1-ak-4
 ```
 
-Replace `INTERNAL_VERSION` with the exact version or commit exposed by the
-organization-approved internal Git service or module proxy. The
-`v2.12.1-ak-3` delivery in this checkout is a local lightweight tag: it is not
-pushed and cannot be resolved through the public Go module proxy. The internal
-mirror requires Go 1.19 or later.
+Use a Git service or module proxy that provides the fork's tags. The internal
+mirror requires Go 1.19 or later. See the
+[v2.12.1-ak-4 release notes](docs/internal-release-notes-v2.12.1-ak-4.md) for the
+concurrency fixes in this version.
 
 ## 🛠 How to use
 Read the local [examples](pool_goid_example_test.go) or run
