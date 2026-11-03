@@ -285,13 +285,16 @@ func TestWorkerIDRegistryPurgeVisitsRunningExpiryPrefix(t *testing.T) {
 		expired = 8
 		total   = expired + 1
 	)
-	p := newPoolWithIDForTest(
+	clock := newPoolWithIDPhase3FakeClock()
+	p := poolWithIDPhase3NewPool(
 		t,
 		total,
+		clock,
 		WithExpiryDuration(time.Hour),
 		WithMaxEscapedWorkers(expired),
 		WithTaskBuffer(1),
 	)
+	poolWithIDP2StopPurge(t, p)
 	releaseTasks := make(chan struct{})
 	closeReleaseTasks := poolWithIDCloseOnCleanup(t, releaseTasks)
 	startedAt := make([]time.Time, total)
@@ -308,6 +311,8 @@ func TestWorkerIDRegistryPurgeVisitsRunningExpiryPrefix(t *testing.T) {
 		}
 		poolWithIDReceive(t, started)
 		_, _, startedAt[id] = poolWithIDObserveEntryState(t, p, id)
+		// Real clocks can return equal timestamps for consecutive task starts.
+		clock.Advance(time.Millisecond)
 	}
 	if !startedAt[expired].After(startedAt[expired-1]) {
 		t.Fatalf("running timestamps are not ordered: %v then %v",
